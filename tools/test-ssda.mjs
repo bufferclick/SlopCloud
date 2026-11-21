@@ -328,8 +328,10 @@ const goodHome = `<html><script src="https://a-v2.sndcdn.com/assets/0-old.js"></
   <script crossorigin src="//a-v2.sndcdn.com/assets/99-app.js"></script></html>`;
 const challengePage = "<html><title>Just a moment...</title>" + "x".repeat(800) + "</html>";
 
-globalThis.fetch = async (input) => {
+globalThis.fetch = async (input, init) => {
   const u = String(input instanceof Request ? input.url : input);
+  const method = String((init && init.method) || (input instanceof Request ? input.method : "GET")).toUpperCase();
+  const redirect = (init && init.redirect) || "follow";
   const R = (body, status = 200, headers = {}) => new Response(body, { status, headers });
   const J = (obj, status = 200) => R(JSON.stringify(obj), status, { "Content-Type": "application/json" });
 
@@ -357,6 +359,8 @@ globalThis.fetch = async (input) => {
     if (target.includes("ogg-only")) return J(oggOnlyFixture);
     if (target.includes("conv-mp3")) return J(convMp3Fixture);
     if (target.includes("conv-aac")) return J(convAacFixture);
+    if (target.includes("shortbad")) return J({ code: "not_a_track", message: "This url is not a track." });
+    if (target.includes("junklink")) return J({});
     if (target.includes("download-track")) return J(downloadFixture);
     if (target.includes("drm-only")) return J(drmOnlyFixture);
     if (target.includes("wav-track")) return J(wavFixture);
@@ -433,6 +437,23 @@ globalThis.fetch = async (input) => {
   if (u.startsWith("https://on.soundcloud.com/short1")) {
     return R(null, 302, { Location: "https://soundcloud.com/test/test-track" });
   }
+  // short2: HEAD gets no Location, GET does. short3: only a followed GET
+  // reveals the target. shortbad: never redirects at all.
+  if (u.startsWith("https://on.soundcloud.com/short2")) {
+    if (method === "HEAD") return R(null, 200);
+    return R(null, 302, { Location: "https://soundcloud.com/test/test-track" });
+  }
+  if (u.startsWith("https://on.soundcloud.com/short3")) {
+    if (method === "GET" && redirect === "follow") {
+      const r = R("<html>ok</html>", 200);
+      Object.defineProperty(r, "url", { value: "https://soundcloud.com/test/test-track" });
+      return r;
+    }
+    return R(null, 200);
+  }
+  if (u.startsWith("https://on.soundcloud.com/shortbad")) {
+    return R(null, 200);
+  }
   console.log("UNMOCKED FETCH:", u);
   return realFetch(input);
 };
@@ -489,6 +510,7 @@ async function call(path, init) {
 
   const mp3 = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/test-track") + "&format=mp3");
   ok(mp3.headers.get("X-SSDA-Extension") === "mp3" && mp3.headers.get("Content-Type") === "audio/mpeg", "format=mp3 passthrough");
+  ok(String(mp3.headers.get("Content-Disposition")).startsWith("inline;"), "format=mp3 on /api/audio is inline (only /api/download attaches)");
 
   const m4a = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/test-track") + "&format=m4a");
   const m4aBytes = new Uint8Array(await m4a.arrayBuffer());
@@ -663,6 +685,30 @@ async function call(path, init) {
   const drm3Err = (await drm3.json()).error;
   ok(drm3.status === 415 && drm3Err.code === "drm_protected" && /DRM/i.test(drm3Err.message),
     "DRM-only + explicit format keeps the clear drm error", JSON.stringify(drm3Err));
+}
+
+// 11. short-link expansion and resolve-body handling
+{
+  console.log("short links:");
+  const s2 = await call("/api/info?url=" + encodeURIComponent("https://on.soundcloud.com/short2"));
+  const s2b = await s2.json();
+  ok(s2.status === 200 && s2b.title === "Test Track",
+    "short link expands via GET when HEAD has no Location", JSON.stringify(s2b));
+
+  const s3 = await call("/api/info?url=" + encodeURIComponent("https://on.soundcloud.com/short3"));
+  const s3b = await s3.json();
+  ok(s3.status === 200 && s3b.title === "Test Track",
+    "short link expands via followed GET when manual hops give no Location", JSON.stringify(s3b));
+
+  const s4 = await call("/api/info?url=" + encodeURIComponent("https://on.soundcloud.com/shortbad"));
+  const s4b = await s4.json();
+  ok(s4.status === 400 && s4b.error && s4b.error.code === "not_a_track",
+    "unexpandable short link + SoundCloud not_a_track body -> clear 400", JSON.stringify(s4b));
+
+  const j = await call("/api/info?url=" + encodeURIComponent("https://soundcloud.com/test/junklink"));
+  const jb = await j.json();
+  ok(j.status === 502 && jb.error && /did not return a track/.test(jb.error.message),
+    "junk resolve body -> clear upstream error", JSON.stringify(jb));
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

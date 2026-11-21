@@ -146,6 +146,27 @@
     return API_BASE.replace(/\/+$/, '') + path;
   }
 
+  // Retry transient gateway failures (502/503/504): the edge function may be
+  // cold-starting or briefly unavailable.
+  async function fetchApi(path, tries) {
+    tries = tries || 3;
+    var res = null;
+    for (var i = 0; i < tries; i++) {
+      res = await fetch(apiUrl(path));
+      if (res.status !== 502 && res.status !== 503 && res.status !== 504) return res;
+      if (i < tries - 1) await new Promise(function (r) { setTimeout(r, 700 * (i + 1)); });
+    }
+    return res;
+  }
+
+  function apiFailError(kind, res) {
+    if (res.status === 502 || res.status === 503 || res.status === 504) {
+      return new Error('The API at ' + apiUrl('') + ' did not respond (' + res.status +
+        '). It may be starting up — try again in a moment.');
+    }
+    return new Error('SSDA ' + kind + ' failed (' + res.status + ')');
+  }
+
   function checkApi() {
     var ctrl = new AbortController();
     var timer = setTimeout(function () { ctrl.abort(); }, 6000);
@@ -157,7 +178,7 @@
       })
       .catch(function () {
         clearTimeout(timer);
-        setStatus('The SSDA API is not reachable right now. Saving and downloading songs will not work.', 'error');
+        setStatus('The SSDA API (' + apiUrl('') + ') is not reachable right now. Saving and downloading songs will not work.', 'error');
       });
   }
 
@@ -369,18 +390,18 @@
     setStatus('Fetching track info…');
     showProgress(0, 0);
     try {
-      var infoRes = await fetch(apiUrl('/api/info?url=' + encodeURIComponent(url)));
+      var infoRes = await fetchApi('/api/info?url=' + encodeURIComponent(url));
       if (!infoRes.ok) {
         var body = await infoRes.json().catch(function () { return null; });
-        throw new Error((body && body.error && body.error.message) || ('SSDA /api/info failed (' + infoRes.status + ')'));
+        throw new Error((body && body.error && body.error.message) || apiFailError('/api/info', infoRes).message);
       }
       var info = await infoRes.json();
       var filename = sanitizeName((info.artist || 'Unknown') + ' - ' + (info.title || 'track'));
 
-      var audioRes = await fetch(apiUrl('/api/audio?url=' + encodeURIComponent(url) + '&format=' + encodeURIComponent(els.format.value)));
+      var audioRes = await fetchApi('/api/audio?url=' + encodeURIComponent(url) + '&format=' + encodeURIComponent(els.format.value));
       if (!audioRes.ok) {
         var audioBody = await audioRes.json().catch(function () { return null; });
-        throw new Error((audioBody && audioBody.error && audioBody.error.message) || ('SSDA /api/audio failed (' + audioRes.status + ')'));
+        throw new Error((audioBody && audioBody.error && audioBody.error.message) || apiFailError('/api/audio', audioRes).message);
       }
       var total = Number(audioRes.headers.get('Content-Length')) || 0;
       var type = audioRes.headers.get('Content-Type') || 'audio/mpeg';

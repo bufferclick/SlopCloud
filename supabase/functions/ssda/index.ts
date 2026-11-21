@@ -20,19 +20,48 @@
 // re-encoded to the requested format (v2.6.0). Only the requested format
 // changes; format=auto is never transcoded.
 
-import { Conversion, Input, Output, BufferTarget, BufferSource, Mp3OutputFormat, Mp4OutputFormat, Mp4InputFormat, Mp3InputFormat, WaveInputFormat, OggInputFormat, AdtsInputFormat, FlacInputFormat } from "npm:mediabunny@1.66.2";
-import { registerMp3Encoder } from "npm:@mediabunny/mp3-encoder@1.66.2";
-import { registerAacEncoder } from "npm:@mediabunny/aac-encoder@1.66.2";
-import decodeAacFile from "npm:@audio/decode-aac@1.6.0";
-import decodeMp3File from "npm:@audio/decode-mp3@1.3.1";
-import { WasmMediaEncoder } from "npm:wasm-media-encoders@0.7.0";
-import oggWasm from "npm:wasm-media-encoders@0.7.0/wasm/ogg.wasm" with { type: "bytes" };
+// The codec packages (several MB with embedded wasm) are imported lazily on
+// first conversion, so ordinary requests keep a light, fast cold start.
 
-registerMp3Encoder();
-registerAacEncoder();
+type ConversionCtor = typeof import("npm:mediabunny@1.66.2");
+type Mp3EncMod = typeof import("npm:@mediabunny/mp3-encoder@1.66.2");
+type AacEncMod = typeof import("npm:@mediabunny/aac-encoder@1.66.2");
+type WmeMod = typeof import("npm:wasm-media-encoders@0.7.0");
+
+let codecsPromise: Promise<{
+  mb: ConversionCtor;
+  decodeAac: (b: Uint8Array) => Promise<Pcm>;
+  decodeMp3: (b: Uint8Array) => Promise<Pcm>;
+  Wme: WmeMod["WasmMediaEncoder"];
+  oggWasm: Uint8Array;
+}> | null = null;
+
+function loadCodecs() {
+  codecsPromise ??= (async () => {
+    const [mb, mp3m, aacm, decodeAac, decodeMp3, wme, ogg] = await Promise.all([
+      import("npm:mediabunny@1.66.2"),
+      import("npm:@mediabunny/mp3-encoder@1.66.2"),
+      import("npm:@mediabunny/aac-encoder@1.66.2"),
+      import("npm:@audio/decode-aac@1.6.0"),
+      import("npm:@audio/decode-mp3@1.3.1"),
+      import("npm:wasm-media-encoders@0.7.0"),
+      import("npm:wasm-media-encoders@0.7.0/wasm/ogg.wasm", { with: { type: "bytes" } }),
+    ]);
+    mp3m.registerMp3Encoder();
+    aacm.registerAacEncoder();
+    return {
+      mb,
+      decodeAac: (b: Uint8Array) => (decodeAac as unknown as { default: (x: Uint8Array) => Promise<Pcm> }).default(b),
+      decodeMp3: (b: Uint8Array) => (decodeMp3 as unknown as { default: (x: Uint8Array) => Promise<Pcm> }).default(b),
+      Wme: wme.WasmMediaEncoder,
+      oggWasm: ogg.default as unknown as Uint8Array,
+    };
+  })();
+  return codecsPromise;
+}
 
 const SERVICE_NAME = "SSDA";
-const VERSION = "2.6.0";
+const VERSION = "2.6.1";
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
@@ -303,6 +332,41 @@ async function getClientId(): Promise<string> {
 
 // ---------------------------------------------------------------- resolve
 
+/**
+ * Expand on.soundcloud.com / snd.sc short links to the full track URL.
+ * SoundCloud's /resolve endpoint rejects unexpanded short links, so this hop
+ * matters: try HEAD with manual redirects, then GET (some short-link CDNs
+ * reject HEAD), then a followed GET whose final URL carries the target.
+ */
+async function expandShortLink(url: string): Promise<string> {
+  for (const method of ["HEAD", "GET"] as const) {
+    try {
+      const hop = await fetch(url, {
+        method,
+        redirect: "manual",
+        headers: { "User-Agent": UA },
+        signal: AbortSignal.timeout(15000),
+      });
+      const loc = hop.headers.get("location");
+      if (loc) return new URL(loc, url).href;
+    } catch {
+      // try the next strategy
+    }
+  }
+  try {
+    const hop = await fetch(url, {
+      method: "GET",
+      redirect: "follow",
+      headers: { "User-Agent": UA },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (hop.url && hop.url !== url) return hop.url;
+  } catch {
+    // give up; the caller falls back to the original link
+  }
+  return url;
+}
+
 interface ScTrack {
   id: number | string;
   title?: string;
@@ -329,18 +393,7 @@ async function resolveTrack(inputUrl: string): Promise<ScTrack> {
 
   const host = new URL(target).hostname.toLowerCase();
   if (host === "on.soundcloud.com" || host === "snd.sc") {
-    try {
-      const hop = await fetch(target, {
-        method: "HEAD",
-        redirect: "manual",
-        headers: { "User-Agent": UA },
-        signal: AbortSignal.timeout(15000),
-      });
-      const loc = hop.headers.get("location");
-      if (loc) target = new URL(loc, target).href;
-    } catch {
-      // keep the short link; resolve may still accept it
-    }
+    target = await expandShortLink(target);
   }
 
   const resolveOnce = async (id: string) => {
@@ -356,6 +409,7 @@ async function resolveTrack(inputUrl: string): Promise<ScTrack> {
   // playable). Try a few times before believing a negative answer.
   let data: Record<string, unknown> | null = null;
   let lastStatus = 0;
+  let lastBodyErr: string | null = null;
   for (let attempt = 0; attempt < 3; attempt++) {
     if (attempt > 0) {
       clientIdCache = null;
@@ -378,9 +432,24 @@ async function resolveTrack(inputUrl: string): Promise<ScTrack> {
     }
     if (!res.ok) continue;
 
-    const body = await res.json();
-    if (!body || (body.kind && body.kind !== "track")) {
-      throw new ApiError(400, "not_a_track", "This link is not a single track (playlists and profiles are not supported).");
+    const body = (await res.json()) as Record<string, unknown> | null;
+    // SoundCloud answers HTTP 200 with {"code":"not_a_track",...} or
+    // {"errors":[...]} for links it cannot resolve (unexpanded short links,
+    // deleted tracks). Only accept bodies that look like a real track.
+    const looksLikeTrack = Boolean(
+      body && (body.kind === "track" || (body.id && (body.title || body.permalink_url))),
+    );
+    if (!looksLikeTrack) {
+      const msg = typeof body?.message === "string" ? body.message : null;
+      lastBodyErr = msg ?? (typeof body?.code === "string" ? body.code : null);
+      if (body?.code === "not_a_track") {
+        throw new ApiError(
+          400,
+          "not_a_track",
+          "This link is not a single track (playlists and profiles are not supported). Short links must point at one track; a full soundcloud.com/artist/track link always works.",
+        );
+      }
+      continue; // maybe a flaky answer; retry before believing it
     }
     if (body.media?.transcodings?.length) {
       data = body;
@@ -393,7 +462,13 @@ async function resolveTrack(inputUrl: string): Promise<ScTrack> {
   }
 
   if (!data) {
-    throw new ApiError(502, "upstream", `SoundCloud resolve failed (HTTP ${lastStatus}).`);
+    throw new ApiError(
+      502,
+      "upstream",
+      lastBodyErr
+        ? `SoundCloud did not return a track for this link (${lastBodyErr}).`
+        : `SoundCloud did not return a track for this link (HTTP ${lastStatus}).`,
+    );
   }
   return data as unknown as ScTrack;
 }
@@ -698,7 +773,10 @@ function audioHeaders(meta: ReturnType<typeof trackMeta>, ext: string, mime: str
   const h = corsHeaders();
   h.set("Content-Type", mime);
   const filename = sanitizeFilename(`${meta.artist} - ${meta.title}`) + "." + ext;
-  const disposition = attachment ? "attachment" : "inline";
+  let disposition = "inline";
+  if (attachment === true) {
+    disposition = "attachment";
+  }
   h.set(
     "Content-Disposition",
     `${disposition}; filename="${filename.replace(/[^\x20-\x7e]/g, "_")}"; filename*=UTF-8''${encodeURIComponent(filename)}`,
@@ -834,8 +912,9 @@ function wavToPcm(bytes: Uint8Array): Pcm {
 }
 
 async function decodeToPcm(bytes: Uint8Array, ext: string): Promise<Pcm> {
-  if (ext === "mp3") return await decodeMp3File(bytes);
-  if (ext === "m4a" || ext === "aac") return await decodeAacFile(bytes);
+  const codecs = await loadCodecs();
+  if (ext === "mp3") return await codecs.decodeMp3(bytes);
+  if (ext === "m4a" || ext === "aac") return await codecs.decodeAac(bytes);
   if (ext === "wav") return wavToPcm(bytes);
   throw new ApiError(415, "unsupported_container", `cannot convert audio from '${ext}'`);
 }
@@ -855,11 +934,12 @@ function resample(ch: Float32Array, from: number, to: number): Float32Array {
 }
 
 async function encodeOpus(pcm: Pcm): Promise<Uint8Array> {
+  const codecs = await loadCodecs();
   const OPUS_RATES = [8000, 12000, 16000, 24000, 48000];
   const rate = OPUS_RATES.includes(pcm.sampleRate) ? pcm.sampleRate : 48000;
   const channels = pcm.channelData.length >= 2 ? 2 : 1;
   const chs = pcm.channelData.slice(0, channels).map((c) => resample(c, pcm.sampleRate, rate));
-  const enc = await WasmMediaEncoder.create("audio/ogg", oggWasm as unknown as Uint8Array);
+  const enc = await codecs.Wme.create("audio/ogg", codecs.oggWasm);
   enc.configure({ channels: channels as 1 | 2, sampleRate: rate, vbrQuality: 8 });
   const parts: Uint8Array[] = [];
   const frame = Math.round(rate * 0.02); // 20 ms frames
@@ -882,6 +962,7 @@ async function encodeOpus(pcm: Pcm): Promise<Uint8Array> {
 }
 
 async function convertAudio(bytes: Uint8Array, srcExt: string, fmt: string): Promise<Rendered> {
+  const codecs = await loadCodecs();
   const pcm = await decodeToPcm(bytes, srcExt);
   if (!pcm.channelData.length || !pcm.channelData[0]?.length) {
     throw new ApiError(415, "unsupported_container", "decoded audio is empty");
@@ -890,6 +971,7 @@ async function convertAudio(bytes: Uint8Array, srcExt: string, fmt: string): Pro
     const ogg = await encodeOpus(pcm);
     return { bytes: ogg, ext: "opus", mime: "audio/ogg", container: "ogg" };
   }
+  const { Conversion, Input, Output, BufferTarget, BufferSource, Mp3OutputFormat, Mp4OutputFormat, WaveInputFormat } = codecs.mb;
   const wav = pcmToWav(pcm);
   const input = new Input({
     source: new BufferSource(wav),
