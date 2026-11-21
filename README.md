@@ -77,13 +77,16 @@ Add `&debug=1` to `/api/info` (or `&debug=probe` to `/api/audio`) for diagnostic
   track has no file in the requested format, the best available rendition is
   decoded and re-encoded to it (`X-SSDA-Format-Note: converted from ... to ...`).
 - Audio responses carry `X-SSDA-Extension` and a `Content-Disposition` filename
-  (`Artist - Title.ext`). When conversion is impossible (for example an
-  undecodable source), the closest rendition is served and
-  `X-SSDA-Format-Note` explains.
+  (`Artist - Title.ext`). When an explicit format is requested and cannot be
+  produced, the API returns a clear `415 conversion_failed` error instead of
+  silently serving a different format; `X-SSDA-Format-Note` reports
+  conversions that did happen.
 - Renditions are container-validated before serving: HLS fMP4/Ogg are
-  assembled as-is, MPEG-TS is demuxed to ADTS AAC, DRM-wrapped (cbcs/cenc)
-  streams are skipped, and the artist's official download file is used when
-  that is the only playable audio.
+  assembled as-is (styp-headed fragments included), MPEG-TS is demuxed to ADTS
+  AAC, DRM-wrapped (cbcs/cenc) streams are skipped, and two fallbacks cover
+  "blocked" tracks: the artist's official download file, and the legacy
+  `api.soundcloud.com/tracks/{id}/stream` endpoint (a plain mp3 — the same
+  source long-lived downloader tools use).
 - CORS is open (`Access-Control-Allow-Origin: *`), so any website can use it.
 - Errors are JSON: `{"error": {"code": "...", "message": "..."}}`.
 
@@ -108,12 +111,13 @@ npm install          # mirrors the function's npm: imports for Node
 node tools/test-ssda.mjs
 ```
 
-58 tests covering routing, format selection, format conversion (real
-decode/re-encode through wasm codecs), HLS assembly, container validation, DRM
-handling, the official-download fallback, short-link expansion, resolve-body
-validation, error shapes, CORS, and resilience (challenge-page retries, flaky
-upstream, oEmbed fallback) — all against a mocked SoundCloud, no network
-needed.
+66 tests covering routing, format selection, format conversion (real
+decode/re-encode through wasm codecs, including styp-headed fMP4 HLS),
+HLS assembly, container validation, DRM handling, the legacy-stream and
+official-download fallbacks, explicit-format fidelity, short-link expansion,
+resolve-body validation, error shapes, CORS, and resilience (challenge-page
+retries, flaky upstream, oEmbed fallback) — all against a mocked SoundCloud,
+no network needed.
 
 ## Notes
 

@@ -184,6 +184,8 @@
         mime: type.split(';')[0].trim(),
         size: blob.size,
         savedAt: Date.now(),
+        note: res.headers.get('X-SSDA-Format-Note') || '',
+        snip: !!info.snip,
       };
 
       var cache = await audioCache();
