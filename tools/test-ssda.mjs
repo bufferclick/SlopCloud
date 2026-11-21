@@ -221,6 +221,49 @@ const legacyOnlyFixture = {
   },
 };
 
+// legacy stream is flaky: first attempt fails, retry must recover
+const legacyFlakyFixture = {
+  kind: "track",
+  id: 611,
+  title: "Legacy Flaky",
+  duration: 30000,
+  permalink_url: "https://soundcloud.com/test/legacy-flaky",
+  downloadable: false,
+  user: { username: "l" },
+  media: { transcodings: [] },
+};
+
+// media URL fails several times then recovers (anti-abuse roulette)
+const mediaFlakyFixture = {
+  kind: "track",
+  id: 612,
+  title: "Media Flaky",
+  duration: 30000,
+  permalink_url: "https://soundcloud.com/test/media-flaky",
+  user: { username: "m" },
+  media: {
+    transcodings: [
+      { url: "https://api-v2.soundcloud.com/media/soundcloud:tracks:612/stream/progressive", format: { protocol: "progressive", mime_type: "audio/mpeg" }, quality: "sq" },
+    ],
+  },
+};
+
+// every source down: the error must say it is often transient
+const allDownFixture = {
+  kind: "track",
+  id: 613,
+  title: "All Down",
+  duration: 30000,
+  permalink_url: "https://soundcloud.com/test/all-down",
+  downloadable: false,
+  user: { username: "a" },
+  media: {
+    transcodings: [
+      { url: "https://api-v2.soundcloud.com/media/soundcloud:tracks:613/stream/progressive", format: { protocol: "progressive", mime_type: "audio/mpeg" }, quality: "sq" },
+    ],
+  },
+};
+
 // ---- real audio fixtures for conversion tests (decoded + re-encoded) ----
 
 registerMp3Encoder();
@@ -382,6 +425,8 @@ const realFetch = globalThis.fetch;
 let homeCalls = 0;
 let flakyCalls = 0;
 let blockedFlakyCalls = 0;
+let legacyFlakyCalls = 0;
+let mediaFlakyCalls = 0;
 let blockMode = false;
 
 const goodHome = `<html><script src="https://a-v2.sndcdn.com/assets/0-old.js"></script>
@@ -419,6 +464,9 @@ globalThis.fetch = async (input, init) => {
     if (target.includes("ogg-only")) return J(oggOnlyFixture);
     if (target.includes("styp-track")) return J(stypFixture);
     if (target.includes("legacy-only")) return J(legacyOnlyFixture);
+    if (target.includes("legacy-flaky")) return J(legacyFlakyFixture);
+    if (target.includes("media-flaky")) return J(mediaFlakyFixture);
+    if (target.includes("all-down")) return J(allDownFixture);
     if (target.includes("conv-mp3")) return J(convMp3Fixture);
     if (target.includes("conv-aac")) return J(convAacFixture);
     if (target.includes("shortbad")) return J({ code: "not_a_track", message: "This url is not a track." });
@@ -447,7 +495,15 @@ globalThis.fetch = async (input, init) => {
   if (u.startsWith("https://api.soundcloud.com/tracks/") && u.includes("/stream")) {
     const id = (u.split("/tracks/")[1] || "").split("/")[0];
     if (id === "610") return R(realMp3, 200, { "Content-Type": "audio/mpeg" });
+    if (id === "611") {
+      legacyFlakyCalls++;
+      return legacyFlakyCalls === 1 ? R("oops", 503) : R(realMp3, 200, { "Content-Type": "audio/mpeg" });
+    }
     return R("not found", 404);
+  }
+  // track endpoint used to fetch a fresh track_authorization
+  if (u.startsWith("https://api-v2.soundcloud.com/tracks/") && u.includes("?client_id=") && !u.includes("/stream") && !u.includes("/download")) {
+    return J({ id: 1, track_authorization: "TATOKEN" });
   }
   // media stream-URL endpoints
   if (u.includes("soundcloud:tracks:777")) {
@@ -461,6 +517,11 @@ globalThis.fetch = async (input, init) => {
   if (u.includes("soundcloud:tracks:801") && u.includes("/stream/progressive")) return J({ url: "https://cf-media.sndcdn.com/conv/real.mp3" });
   if (u.includes("soundcloud:tracks:802") && u.includes("/stream/progressive")) return J({ url: "https://cf-media.sndcdn.com/conv/real.m4a" });
   if (u.includes("soundcloud:tracks:444") && u.includes("/stream/progressive")) return J({ url: "https://cf-media.sndcdn.com/conv/real.mp3" });
+  if (u.includes("soundcloud:tracks:612") && u.includes("/stream/progressive")) {
+    mediaFlakyCalls++;
+    return mediaFlakyCalls <= 4 ? J({ error: "not found" }, 404) : J({ url: "https://cf-media.sndcdn.com/conv/real.mp3" });
+  }
+  if (u.includes("soundcloud:tracks:613") && u.includes("/stream/progressive")) return J({ error: "not found" }, 404);
   if (u.includes("/stream/progressive")) return J({ url: "https://cf-media.sndcdn.com/tkHfEWxK.mp3" });
   if (u.includes("/stream/hls/badaac")) return J({ url: "https://cf-hls-media.sndcdn.com/bad/playlist.m3u8" });
   if (u.includes("/stream/hls/ts")) return J({ url: "https://cf-hls-media.sndcdn.com/ts/playlist.m3u8" });
@@ -793,6 +854,27 @@ async function call(path, init) {
   const metaBody = await meta.json();
   ok("policy" in metaBody && metaBody.snip === false,
     "info exposes policy/snip fields", JSON.stringify({ policy: metaBody.policy, snip: metaBody.snip }));
+}
+
+// 10c. transient anti-abuse failures must not dead-end a request
+{
+  console.log("transient retries:");
+  // legacy stream 503s once, the in-render retry recovers
+  const lf = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/legacy-flaky"));
+  const lfBytes = new Uint8Array(await lf.arrayBuffer());
+  ok(lf.status === 200 && lf.headers.get("X-SSDA-Extension") === "mp3" && lfBytes.length === realMp3.length,
+    "legacy stream retry recovers from a transient 503", String(lf.status) + " " + lf.headers.get("X-SSDA-Extension"));
+
+  // media URL 404s repeatedly, the full-pass retry recovers
+  const mf = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/media-flaky"));
+  ok(mf.status === 200 && mf.headers.get("X-SSDA-Extension") === "mp3",
+    "full-pass retry recovers after repeated media 404s", String(mf.status) + " " + mf.headers.get("X-SSDA-Extension"));
+
+  // everything down for real: clear error that says it is often transient
+  const ad = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/all-down"));
+  const adErr = (await ad.json()).error;
+  ok(ad.status === 502 && adErr.code === "upstream" && /transient/i.test(adErr.message),
+    "all-sources-down error says it is often transient", JSON.stringify(adErr));
 }
 
 // 11. short-link expansion and resolve-body handling

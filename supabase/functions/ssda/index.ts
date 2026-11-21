@@ -64,7 +64,7 @@ function loadCodecs() {
 }
 
 const SERVICE_NAME = "SSDA";
-const VERSION = "2.7.0";
+const VERSION = "2.7.1";
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
@@ -587,11 +587,8 @@ function buildCandidates(track: ScTrack, fmt: string): Candidate[] {
   const list = track.media?.transcodings ?? [];
   const dl = downloadTranscoding(track);
   if (list.length === 0 && !dl) {
-    throw new ApiError(
-      403,
-      "not_streamable",
-      "This track cannot be streamed (restricted, or only available with a Go+ subscription). If you just tried again shortly, the track may work on a retry.",
-    );
+    // No api-v2 renditions at all: the legacy stream may still have audio.
+    return [legacyStreamCandidate(track)];
   }
   const by = (kind: Kind) => list.filter((t) => classifyTranscoding(t) === kind);
   const buckets: Record<string, Transcoding[]> = {
@@ -627,11 +624,15 @@ function buildCandidates(track: ScTrack, fmt: string): Candidate[] {
 
 async function getStreamUrl(transcoding: Transcoding, track?: ScTrack): Promise<string> {
   let lastStatus = 0;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  let ta = track?.track_authorization ?? null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) {
+      clientIdCache = null;
+      await sleep(350 * attempt);
+    }
     const cid = await getClientId();
     const u = new URL(transcoding.url);
     if (!u.searchParams.has("client_id")) u.searchParams.set("client_id", cid);
-    const ta = track?.track_authorization;
     if (ta && !u.searchParams.has("track_authorization")) {
       u.searchParams.set("track_authorization", ta);
     }
@@ -646,9 +647,28 @@ async function getStreamUrl(transcoding: Transcoding, track?: ScTrack): Promise<
     } else if (res.status !== 401 && res.status !== 403 && res.status !== 404) {
       break; // not a token problem; retrying will not help
     }
-    clientIdCache = null;
+    // token/authorization problem: try to fetch a fresh track_authorization
+    if (track && !ta) {
+      ta = await fetchTrackAuthorization(track);
+    }
   }
   throw new ApiError(502, "upstream", `Could not get the audio stream URL (HTTP ${lastStatus}).`);
+}
+
+/** Some media URLs need a track_authorization that resolve didn't include. */
+async function fetchTrackAuthorization(track: ScTrack): Promise<string | null> {
+  try {
+    const cid = await getClientId();
+    const res = await fetch(`https://api-v2.soundcloud.com/tracks/${track.id}?client_id=${cid}`, {
+      headers: { Accept: "application/json", "User-Agent": UA },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) return null;
+    const d = await res.json();
+    return typeof d?.track_authorization === "string" ? d.track_authorization : null;
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------- hls
@@ -832,23 +852,33 @@ interface Rendered {
 async function renderCandidate(track: ScTrack, cand: Candidate): Promise<Rendered> {
   if (cand.legacy) {
     // Legacy public stream endpoint: a plain mp3 redirect, no media URL JSON.
-    let cid = await getClientId();
+    // SoundCloud intermittently bot-challenges it, so retry with fresh state.
     let bytes: Uint8Array | null = null;
-    for (let attempt = 0; attempt < 2; attempt++) {
+    let lastStatus = 0;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) {
+        clientIdCache = null;
+        await sleep(350 * attempt);
+      }
+      const cid = await getClientId();
       const res = await fetch(`${cand.transcoding.url}?client_id=${cid}`, {
         headers: { "User-Agent": UA },
         redirect: "follow",
         signal: AbortSignal.timeout(30000),
       });
+      lastStatus = res.status;
       if (res.ok) {
-        bytes = new Uint8Array(await res.arrayBuffer());
-        break;
+        const got = new Uint8Array(await res.arrayBuffer());
+        if (containerOf(got) !== "unknown" || attempt === 2) {
+          bytes = got;
+          break;
+        }
+        // 200 with junk bytes = challenge page; retry
       }
-      if (res.status !== 401 && res.status !== 403) break;
-      clientIdCache = null; // token rejected; retry once with a fresh client_id
-      cid = await getClientId();
     }
-    if (!bytes) throw new ApiError(502, "upstream", "legacy stream endpoint did not return audio");
+    if (!bytes) {
+      throw new ApiError(502, "upstream", `legacy stream endpoint did not return audio (HTTP ${lastStatus})`);
+    }
     const container = containerOf(bytes);
     const out = CONTAINER_OUT[container];
     if (!out) throw new ApiError(415, "unsupported_container", `legacy stream is not playable audio (${container})`);
@@ -1285,7 +1315,32 @@ async function convertAudio(bytes: Uint8Array, srcExt: string, fmt: string): Pro
   };
 }
 
+/**
+ * Serve audio with one full retry pass on transient upstream failures:
+ * SoundCloud's anti-abuse/region roulette occasionally fails every source at
+ * once (legacy stream + media URLs together); a fresh pass with a new
+ * client_id usually recovers within a second or two.
+ */
 async function serveAudio(url: string, fmt: string, attachment: boolean): Promise<Response> {
+  try {
+    return await serveAudioPass(url, fmt, attachment);
+  } catch (err) {
+    const transient = err instanceof ApiError && err.code === "upstream" && err.status === 502;
+    if (!transient) throw err;
+    clientIdCache = null;
+    await sleep(700);
+    try {
+      return await serveAudioPass(url, fmt, attachment);
+    } catch (err2) {
+      if (err2 instanceof ApiError && err2.code === "upstream" && err2.status === 502) {
+        throw new ApiError(502, "upstream", `${err2.message} This is often transient - try again in a few seconds.`);
+      }
+      throw err2;
+    }
+  }
+}
+
+async function serveAudioPass(url: string, fmt: string, attachment: boolean): Promise<Response> {
   const track = await resolveTrack(url);
   const meta = trackMeta(track, url);
   const candidates = buildCandidates(track, fmt);
@@ -1341,6 +1396,16 @@ async function serveAudio(url: string, fmt: string, attachment: boolean): Promis
       415,
       "drm_protected",
       "SoundCloud serves only DRM-encrypted audio for this track and offers no download file. SlopCloud will not serve encrypted bytes; if you have the audio file, the site can save it to the cache.",
+    );
+  }
+  if (
+    lastErr && lastErr.code === "upstream" &&
+    (track.media?.transcodings ?? []).length === 0 && !downloadTranscoding(track)
+  ) {
+    throw new ApiError(
+      403,
+      "not_streamable",
+      "This track cannot be streamed (restricted, or only available with a Go+ subscription). If you just tried again shortly, the track may work on a retry.",
     );
   }
   throw lastErr ??

@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SlopCloud embed demo</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+  input, select, button { font: inherit; padding: .4rem .6rem; }
+  input[type=text] { width: 100%; box-sizing: border-box; }
+  li { margin: .4rem 0; }
+  .muted { color: #666; font-size: .9em; }
+</style>
+</head>
+<body>
+<h1>SlopCloud embed demo</h1>
+<p class="muted">
+  This page is a complete example of embedding SlopCloud in your own site:
+  it saves songs into <em>this origin's</em> browser cache (Cache API +
+  IndexedDB) via <code>site/slopcloud.js</code> and the public SSDA API.
+  Clearing this site's stored data deletes the songs.
+</p>
+
+<form id="add-form">
+  <p><input id="link" type="text" placeholder="SoundCloud link, e.g. https://on.soundcloud.com/dQ3hr5TOmTdN99qMje" required></p>
+  <p>
+    <select id="format">
+      <option value="auto">auto (smallest, same quality)</option>
+      <option value="mp3">mp3</option>
+      <option value="m4a">m4a</option>
+      <option value="opus">opus</option>
+    </select>
+    <button type="submit">Save to cache</button>
+  </p>
+</form>
+<p id="status" class="muted"></p>
+
+<h2>Cached songs</h2>
+<ul id="songs"></ul>
+<p id="usage" class="muted"></p>
+
+<script src="slopcloud.js"></script>
+<script>
+  var API = 'https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/ssda';
+  var statusEl = document.getElementById('status');
+  var songsEl = document.getElementById('songs');
+  var usageEl = document.getElementById('usage');
+
+  function say(msg, isError) {
+    statusEl.textContent = msg || '';
+    statusEl.style.color = isError ? '#b00' : '#666';
+  }
+
+  async function refresh() {
+    var songs = await SlopCloud.listSongs();
+    songsEl.innerHTML = '';
+    songs.forEach(function (s) {
+      var li = document.createElement('li');
+      var label = s.artist + ' – ' + s.title + ' (' + (s.ext || '?') + ', ' +
+        Math.round((s.size || 0) / 1024) + ' KB)';
+      var play = document.createElement('button');
+      play.textContent = '▶';
+      play.onclick = async function () {
+        var url = await SlopCloud.createObjectURL(s.id);
+        new Audio(url).play();
+      };
+      var del = document.createElement('button');
+      del.textContent = '✕';
+      del.onclick = async function () {
+        await SlopCloud.deleteSong(s.id);
+        await refresh();
+      };
+      li.appendChild(document.createTextNode(label + ' '));
+      li.appendChild(play);
+      li.appendChild(del);
+      songsEl.appendChild(li);
+    });
+    var u = await SlopCloud.usage();
+    usageEl.textContent = songs.length + ' songs · ' +
+      (u.used / 1048576).toFixed(1) + ' MB used of ' +
+      (u.quota ? (u.quota / 1073741824).toFixed(1) + ' GB' : 'unknown');
+  }
+
+  document.getElementById('add-form').addEventListener('submit', async function (e) {
+    e.preventDefault();
+    var link = document.getElementById('link').value.trim();
+    if (!link) return;
+    say('Fetching…');
+    try {
+      var song = await SlopCloud.fetchAndCache(API, link, {
+        format: document.getElementById('format').value,
+        onProgress: function (loaded, total) {
+          say('Downloading ' + (loaded / 1048576).toFixed(1) + ' / ' +
+            (total ? (total / 1048576).toFixed(1) + ' MB' : '?'));
+        },
+      });
+      say('Saved: ' + song.artist + ' – ' + song.title + (song.note ? ' (' + song.note + ')' : ''));
+      document.getElementById('link').value = '';
+      await refresh();
+    } catch (err) {
+      say(err.message, true);
+    }
+  });
+
+  (async function () {
+    await SlopCloud.init();
+    await refresh();
+  })();
+</script>
+</body>
+</html>

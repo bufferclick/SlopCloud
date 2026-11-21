@@ -96,6 +96,68 @@ The function is deployed in the Supabase project `SlopCloud`
 (`supabase functions deploy ssda --no-verify-jwt`) or through the connected
 Supabase app.
 
+## Use SlopCloud in your own site
+
+Two integration levels.
+
+### A. Raw HTTP calls (any language)
+
+The API is stateless and CORS-open, so any page can fetch the bytes and keep
+them however it likes. A minimal save-to-cache flow in plain JS:
+
+```js
+const API = 'https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/ssda';
+const info  = await (await fetch(API + '/api/info?url=' + encodeURIComponent(link))).json();
+const audio = await fetch(API + '/api/audio?url=' + encodeURIComponent(link) + '&format=mp3');
+// audio.headers has Content-Type, X-SSDA-Extension, X-SSDA-Format-Note
+const blob = await audio.blob();
+```
+
+### B. Drop-in browser library (cache + library + playback)
+
+`site/slopcloud.js` is the storage layer this site uses — standalone, no
+dependencies. Include it and you get the same "save to cache" behaviour:
+audio bytes live in the visitor's browser (Cache API + IndexedDB) under
+**your** origin, so clearing your site's data deletes the songs and nothing is
+stored on any server. There is no API endpoint that can write into a visitor's
+browser cache — the browser does the storing, this library does the work.
+
+```html
+<script src="https://bufferclick.github.io/SlopCloud/site/slopcloud.js"></script>
+<script>
+  const API = 'https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/ssda';
+  await SlopCloud.init();
+
+  // save a song into this visitor's browser cache
+  const song = await SlopCloud.fetchAndCache(API, 'https://on.soundcloud.com/dQ3hr5TOmTdN99qMje', {
+    format: 'auto',                                   // or 'mp3' / 'm4a' / 'opus'
+    onProgress: (loaded, total) => console.log(loaded, total),
+  });
+
+  // list, play, delete
+  const songs = await SlopCloud.listSongs();
+  const url = await SlopCloud.createObjectURL(song.id);
+  new Audio(url).play();
+  await SlopCloud.deleteSong(song.id);
+</script>
+```
+
+| function | what it does |
+| --- | --- |
+| `init()` | open storage; safe to call repeatedly |
+| `fetchAndCache(apiBase, url, opts)` | download a SoundCloud link into the cache; `opts = { format='auto', onProgress(loaded,total), skipIfCached=false }`; returns the song record |
+| `importFile(file)` | store a local audio file in the cache |
+| `listSongs()` | all cached song records, newest first |
+| `getSong(id)` / `getSongBlob(id)` | one record / its audio Blob |
+| `createObjectURL(id)` / `releaseObjectURL(url)` | playback URLs |
+| `deleteSong(id)` / `clearAll()` | remove one / all songs |
+| `usage()` | `{ used, quota, songs }` |
+| `saveFile(blob, filename)` | trigger a browser download of a Blob |
+
+A complete working example page lives at
+[`site/embed-demo.html`](site/embed-demo.html)
+(runnable copy: `https://bufferclick.github.io/SlopCloud/site/embed-demo.html`).
+
 ## Run the site locally
 
 The site is plain static files — any static server works:

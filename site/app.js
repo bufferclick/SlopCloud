@@ -131,13 +131,7 @@
   }
 
   function saveBlobToFile(blob, filename) {
-    var a = document.createElement('a');
-    var url = URL.createObjectURL(blob);
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(function () { URL.revokeObjectURL(url); a.remove(); }, 5000);
+    SlopCloud.saveFile(blob, filename);
   }
 
   // ---------- API status ----------
