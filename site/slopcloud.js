@@ -22,6 +22,27 @@
   var DB_VERSION = 2;
   var STORE = 'songs';
 
+  // Retry transient gateway failures (502/503/504).
+  async function fetchRetry(url, tries) {
+    tries = tries || 3;
+    var res = null;
+    for (var i = 0; i < tries; i++) {
+      res = await fetch(url);
+      if (res.status !== 502 && res.status !== 503 && res.status !== 504) return res;
+      if (i < tries - 1) await new Promise(function (r) { setTimeout(r, 700 * (i + 1)); });
+    }
+    return res;
+  }
+
+  function apiError(kind, base, res, errBody) {
+    if (errBody && errBody.error && errBody.error.message) return new Error(errBody.error.message);
+    if (res.status === 502 || res.status === 503 || res.status === 504) {
+      return new Error('The API at ' + (base || 'SSDA') + ' did not respond (' + res.status +
+        '). It may be starting up — try again in a moment.');
+    }
+    return new Error('SSDA ' + kind + ' failed (' + res.status + ')');
+  }
+
   function cacheKey(id) {
     return new URL('./slopcloud/audio/' + id, location.href).href;
   }
@@ -109,10 +130,10 @@
       var base = (apiBase || '').replace(/\/+$/, '');
       var format = opts.format || 'auto';
 
-      var infoRes = await fetch(base + '/api/info?url=' + encodeURIComponent(soundcloudUrl));
+      var infoRes = await fetchRetry(base + '/api/info?url=' + encodeURIComponent(soundcloudUrl));
       if (!infoRes.ok) {
         var errBody = await infoRes.json().catch(function () { return null; });
-        throw new Error((errBody && errBody.error && errBody.error.message) || ('SSDA /api/info failed (' + infoRes.status + ')'));
+        throw apiError('/api/info', base, infoRes, errBody);
       }
       var info = await infoRes.json();
       var id = hashId(info.permalink_url || soundcloudUrl);
@@ -122,10 +143,10 @@
         if (existing) return existing;
       }
 
-      var res = await fetch(base + '/api/audio?url=' + encodeURIComponent(soundcloudUrl) + '&format=' + encodeURIComponent(format));
+      var res = await fetchRetry(base + '/api/audio?url=' + encodeURIComponent(soundcloudUrl) + '&format=' + encodeURIComponent(format));
       if (!res.ok) {
         var audioErr = await res.json().catch(function () { return null; });
-        throw new Error((audioErr && audioErr.error && audioErr.error.message) || ('SSDA /api/audio failed (' + res.status + ')'));
+        throw apiError('/api/audio', base, res, audioErr);
       }
 
       var total = Number(res.headers.get('Content-Length')) || 0;

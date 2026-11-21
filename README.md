@@ -54,6 +54,22 @@ GET /api/audio?url=<link>&format=auto|m4a|mp3|opus   audio bytes
 GET /api/download?url=<link>                 audio bytes as a file download
 ```
 
+Base URL (live, CORS open — call it from anywhere):
+
+```
+https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/ssda
+```
+
+Quick try (any SoundCloud track link, short or full):
+
+```sh
+curl "https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/ssda/api/health"
+curl "https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/ssda/api/info?url=https://soundcloud.com/alexg232/harvey"
+curl -o song.mp3 "https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/ssda/api/audio?url=https://soundcloud.com/alexg232/harvey&format=mp3"
+```
+
+Add `&debug=1` to `/api/info` (or `&debug=probe` to `/api/audio`) for diagnostics.
+
 - `url` must be a SoundCloud link (`soundcloud.com`, `on.soundcloud.com`,
   `snd.sc`); short links are resolved. Playlists and profiles are rejected.
 - `format=auto` picks the progressive mp3 first, then m4a, then opus, and is
@@ -92,11 +108,12 @@ npm install          # mirrors the function's npm: imports for Node
 node tools/test-ssda.mjs
 ```
 
-54 tests covering routing, format selection, format conversion (real
+58 tests covering routing, format selection, format conversion (real
 decode/re-encode through wasm codecs), HLS assembly, container validation, DRM
-handling, the official-download fallback, error shapes, CORS, and resilience
-(challenge-page retries, flaky upstream, oEmbed fallback) — all against a
-mocked SoundCloud, no network needed.
+handling, the official-download fallback, short-link expansion, resolve-body
+validation, error shapes, CORS, and resilience (challenge-page retries, flaky
+upstream, oEmbed fallback) — all against a mocked SoundCloud, no network
+needed.
 
 ## Notes
 
