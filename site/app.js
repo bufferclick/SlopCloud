@@ -369,7 +369,10 @@
         format: els.format.value,
         onProgress: showProgress,
       });
-      setStatus('Saved to cache: ' + record.artist + ' – ' + record.title, 'ok');
+      var saved = 'Saved to cache: ' + record.artist + ' – ' + record.title;
+      if (record.note) saved += ' (' + record.note + ')';
+      if (record.snip) saved += ' – preview-only track, may be short';
+      setStatus(saved, 'ok');
       els.url.value = '';
       await reloadSongs();
     } catch (e) {
@@ -426,7 +429,11 @@
       }
 
       saveBlobToFile(new Blob(chunks, { type: type }), filename + '.' + ext);
-      setStatus('Saved to files: ' + filename + '.' + ext, 'ok');
+      var saved = 'Saved to files: ' + filename + '.' + ext;
+      var note = audioRes.headers.get('X-SSDA-Format-Note');
+      if (note) saved += ' (' + note + ')';
+      if (info.snip) saved += ' – preview-only track, may be short';
+      setStatus(saved, 'ok');
     } catch (e) {
       setStatus(e.message, 'error');
     } finally {

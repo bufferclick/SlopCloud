@@ -189,6 +189,38 @@ const oggOnlyFixture = {
   },
 };
 
+// SoundCloud-style HLS: no EXT-X-MAP, styp-prefixed fragment segments
+const stypFixture = {
+  kind: "track",
+  id: 606,
+  title: "Styp Track",
+  duration: 350,
+  permalink_url: "https://soundcloud.com/test/styp-track",
+  user: { username: "s" },
+  media: {
+    transcodings: [
+      { url: "https://api-v2.soundcloud.com/media/soundcloud:tracks:606/stream/hls/styp", format: { protocol: "hls", mime_type: "audio/mpegurl" }, quality: "sq" },
+    ],
+  },
+};
+
+// api-v2 renditions are DRM-only, but the legacy stream endpoint still
+// serves a plain mp3 (the honeypie case that downloader tools handle)
+const legacyOnlyFixture = {
+  kind: "track",
+  id: 610,
+  title: "Legacy Only",
+  duration: 30000,
+  permalink_url: "https://soundcloud.com/test/legacy-only",
+  downloadable: false,
+  user: { username: "l" },
+  media: {
+    transcodings: [
+      { url: "https://api-v2.soundcloud.com/media/soundcloud:tracks:610/stream/cbc-encrypted-hls", format: { protocol: "cbc-encrypted-hls", mime_type: 'audio/mp4; codecs="mp4a.40.2"' }, quality: "sq" },
+    ],
+  },
+};
+
 // ---- real audio fixtures for conversion tests (decoded + re-encoded) ----
 
 registerMp3Encoder();
@@ -301,6 +333,34 @@ const drmMediaPlaylist = [
   "#EXT-X-ENDLIST",
 ].join("\n");
 
+// SoundCloud-style fMP4 HLS segments: styp box + moof/mdat fragments
+function splitFmp4(bytes) {
+  let p = 0;
+  let firstMoof = -1;
+  while (p + 8 <= bytes.length) {
+    const size = new DataView(bytes.buffer, bytes.byteOffset + p, 8).getUint32(0);
+    const type = String.fromCharCode(...bytes.slice(p + 4, p + 8));
+    if (type === "moof" && firstMoof < 0) firstMoof = p;
+    if (size < 8) break;
+    p += size;
+  }
+  return { init: bytes.slice(0, firstMoof), frags: bytes.slice(firstMoof) };
+}
+const stypBox = new Uint8Array([0, 0, 0, 12, 0x73, 0x74, 0x79, 0x70, 0x6d, 0x73, 0x69, 0x78]); // 'styp msix'
+const realFmp4Frag = await wavToBytes(synthWav(44100), new Mp4OutputFormat({ fastStart: "fragmented" }), "aac", 96_000);
+const stypFmp4 = splitFmp4(realFmp4Frag);
+if (stypFmp4.frags.length < 16) throw new Error("fragmented fMP4 has no moof/mdat; cannot build styp fixture");
+const stypInit = new Uint8Array([...stypBox, ...stypFmp4.init]);
+const stypSegment = new Uint8Array([...stypBox, ...stypFmp4.frags]);
+
+const stypMediaPlaylist = [
+  "#EXTM3U",
+  '#EXT-X-MAP:URI="init.styp"',
+  "#EXTINF:1.0,",
+  "seg1.styp",
+  "#EXT-X-ENDLIST",
+].join("\n");
+
 // two MPEG-TS packets carrying one PES with one ADTS frame (9 bytes)
 function makeTs() {
   const adts = [0xff, 0xf1, 0x50, 0x80, 0x01, 0x3f, 0xfc, 0x11, 0x22]; // frame_length = 9
@@ -357,6 +417,8 @@ globalThis.fetch = async (input, init) => {
     if (target.includes("restricted")) return J(restrictedFixture);
     if (target.includes("weird")) return J(weirdFixture);
     if (target.includes("ogg-only")) return J(oggOnlyFixture);
+    if (target.includes("styp-track")) return J(stypFixture);
+    if (target.includes("legacy-only")) return J(legacyOnlyFixture);
     if (target.includes("conv-mp3")) return J(convMp3Fixture);
     if (target.includes("conv-aac")) return J(convAacFixture);
     if (target.includes("shortbad")) return J({ code: "not_a_track", message: "This url is not a track." });
@@ -381,6 +443,12 @@ globalThis.fetch = async (input, init) => {
     if (target.includes("missing")) return J({ errors: [{ error_message: "404 - Not Found" }] }, 404);
     return J(trackFixture);
   }
+  // legacy public stream endpoint (what downloader tools use for "blocked" tracks)
+  if (u.startsWith("https://api.soundcloud.com/tracks/") && u.includes("/stream")) {
+    const id = (u.split("/tracks/")[1] || "").split("/")[0];
+    if (id === "610") return R(realMp3, 200, { "Content-Type": "audio/mpeg" });
+    return R("not found", 404);
+  }
   // media stream-URL endpoints
   if (u.includes("soundcloud:tracks:777")) {
     if (!u.includes("track_authorization=TOKEN123")) return J({ error: "not found" }, 404);
@@ -392,10 +460,12 @@ globalThis.fetch = async (input, init) => {
   if (u.includes("/tracks/604/download")) return J({ url: "https://cf-media.sndcdn.com/x4.128.mp3" });
   if (u.includes("soundcloud:tracks:801") && u.includes("/stream/progressive")) return J({ url: "https://cf-media.sndcdn.com/conv/real.mp3" });
   if (u.includes("soundcloud:tracks:802") && u.includes("/stream/progressive")) return J({ url: "https://cf-media.sndcdn.com/conv/real.m4a" });
+  if (u.includes("soundcloud:tracks:444") && u.includes("/stream/progressive")) return J({ url: "https://cf-media.sndcdn.com/conv/real.mp3" });
   if (u.includes("/stream/progressive")) return J({ url: "https://cf-media.sndcdn.com/tkHfEWxK.mp3" });
   if (u.includes("/stream/hls/badaac")) return J({ url: "https://cf-hls-media.sndcdn.com/bad/playlist.m3u8" });
   if (u.includes("/stream/hls/ts")) return J({ url: "https://cf-hls-media.sndcdn.com/ts/playlist.m3u8" });
   if (u.includes("/stream/hls/oggonly")) return J({ url: "https://cf-hls-media.sndcdn.com/opus/playlist.m3u8?token=abc" });
+  if (u.includes("/stream/hls/styp")) return J({ url: "https://cf-hls-media.sndcdn.com/styp/playlist.m3u8" });
   if (u.includes("/stream/hls/aac")) return J({ url: "https://cf-hls-media.sndcdn.com/aac/master.m3u8?token=abc" });
   if (u.includes("/stream/hls")) return J({ url: "https://cf-hls-media.sndcdn.com/opus/playlist.m3u8?token=abc" });
   // audio bytes / playlists
@@ -415,6 +485,9 @@ globalThis.fetch = async (input, init) => {
     return R(new Uint8Array([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x41, 0x56, 0x45, 0, 0]), 200, { "Content-Type": "audio/wav" });
   }
   if (u.startsWith("https://cf-hls-media.sndcdn.com/drm/playlist.m3u8")) return R(drmMediaPlaylist);
+  if (u === "https://cf-hls-media.sndcdn.com/styp/playlist.m3u8") return R(stypMediaPlaylist);
+  if (u === "https://cf-hls-media.sndcdn.com/styp/init.styp") return R(stypInit, 200, { "Content-Type": "video/mp4" });
+  if (u === "https://cf-hls-media.sndcdn.com/styp/seg1.styp") return R(stypSegment, 200, { "Content-Type": "video/mp4" });
   if (u.startsWith("https://cf-hls-media.sndcdn.com/drm/init.mp4")) {
     return R(new Uint8Array([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x35]));
   }
@@ -543,11 +616,11 @@ async function call(path, init) {
   ok(weirdOpus.status === 200 && weirdOpus.headers.get("X-SSDA-Extension") === "opus",
     "explicit format prefers an exact match over an earlier fallback candidate", String(weirdOpus.headers.get("X-SSDA-Extension")));
 
-  // when the source cannot be converted the old fallback note still applies
+  // when the source cannot be converted: clear error, never the wrong ext
   const oggToM4a = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/ogg-only") + "&format=m4a");
-  ok(oggToM4a.status === 200 && oggToM4a.headers.get("X-SSDA-Extension") === "opus" &&
-    String(oggToM4a.headers.get("X-SSDA-Format-Note")).includes("no m4a rendition"),
-    "explicit format falls back with a note when the source cannot be converted", String(oggToM4a.headers.get("X-SSDA-Format-Note")));
+  const oggToM4aErr = (await oggToM4a.json()).error;
+  ok(oggToM4a.status === 415 && oggToM4aErr.code === "conversion_failed",
+    "explicit format errors when the source cannot be converted (never the wrong ext)", JSON.stringify(oggToM4aErr));
 
   const oggOnly = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/ogg-only") + "&format=auto");
   ok(oggOnly.status === 200 && oggOnly.headers.get("X-SSDA-Extension") === "opus",
@@ -572,9 +645,9 @@ async function call(path, init) {
   ok(ts.headers.get("X-SSDA-Format-Note") === "stream container converted to adts aac", "conversion note set");
 
   const skip = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/skip-bad") + "&format=m4a");
-  ok(skip.status === 200 && skip.headers.get("X-SSDA-Extension") === "mp3",
-    "broken rendition skipped, next candidate served", String(skip.status) + " " + skip.headers.get("X-SSDA-Extension"));
-  ok(String(skip.headers.get("X-SSDA-Format-Note")).includes("no m4a rendition"), "fallback note present", String(skip.headers.get("X-SSDA-Format-Note")));
+  ok(skip.status === 200 && skip.headers.get("X-SSDA-Extension") === "m4a",
+    "broken rendition skipped, next candidate converted to the requested format", String(skip.status) + " " + skip.headers.get("X-SSDA-Extension"));
+  ok(String(skip.headers.get("X-SSDA-Format-Note")) === "converted from mp3 to m4a", "conversion note present", String(skip.headers.get("X-SSDA-Format-Note")));
 }
 
 // 6b. DRM and the official download file
@@ -685,6 +758,41 @@ async function call(path, init) {
   const drm3Err = (await drm3.json()).error;
   ok(drm3.status === 415 && drm3Err.code === "drm_protected" && /DRM/i.test(drm3Err.message),
     "DRM-only + explicit format keeps the clear drm error", JSON.stringify(drm3Err));
+}
+
+// 10b. SoundCloud-style styp HLS, legacy fallback, and format fidelity
+{
+  console.log("styp + legacy + format fidelity:");
+  // styp-headed HLS (no EXT-X-MAP) must be recognized as fMP4 and converted
+  const styp = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/styp-track") + "&format=mp3");
+  const stypBytes = new Uint8Array(await styp.arrayBuffer());
+  ok(styp.status === 200 && styp.headers.get("X-SSDA-Extension") === "mp3",
+    "styp HLS converts to the requested mp3", String(styp.status) + " " + styp.headers.get("X-SSDA-Extension"));
+  ok(stypBytes.length > 200 && (stypBytes[0] === 0x49 || stypBytes[0] === 0xff),
+    "converted mp3 from styp HLS has real frames", "len=" + stypBytes.length + " body=" + new TextDecoder().decode(stypBytes));
+  ok(String(styp.headers.get("X-SSDA-Format-Note")) === "converted from m4a to mp3",
+    "styp conversion note set", String(styp.headers.get("X-SSDA-Format-Note")));
+
+  // DRM-only api-v2 renditions, but the legacy stream has a plain mp3:
+  // this is the honeypie case that other downloader tools serve
+  const leg = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/legacy-only") + "&format=mp3");
+  const legBytes = new Uint8Array(await leg.arrayBuffer());
+  ok(leg.status === 200 && leg.headers.get("X-SSDA-Extension") === "mp3" && legBytes.length === realMp3.length,
+    "legacy stream serves mp3 when api-v2 is DRM-only", String(leg.status) + " " + leg.headers.get("X-SSDA-Extension"));
+  const legAuto = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/legacy-only"));
+  ok(legAuto.status === 200 && legAuto.headers.get("X-SSDA-Extension") === "mp3", "legacy stream also serves auto format");
+
+  // unconvertible source + explicit format -> clear error, never the wrong ext
+  const badConv = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/ogg-only") + "&format=mp3");
+  const badConvErr = (await badConv.json()).error;
+  ok(badConv.status === 415 && badConvErr.code === "conversion_failed",
+    "unconvertible source with explicit format errors instead of wrong ext", JSON.stringify(badConvErr));
+
+  // info exposes the policy so clients can warn about preview-only tracks
+  const meta = await call("/api/info?url=" + encodeURIComponent("https://soundcloud.com/test/test-track"));
+  const metaBody = await meta.json();
+  ok("policy" in metaBody && metaBody.snip === false,
+    "info exposes policy/snip fields", JSON.stringify({ policy: metaBody.policy, snip: metaBody.snip }));
 }
 
 // 11. short-link expansion and resolve-body handling

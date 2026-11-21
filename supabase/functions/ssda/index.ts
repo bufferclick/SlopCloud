@@ -56,12 +56,15 @@ function loadCodecs() {
       Wme: wme.WasmMediaEncoder,
       oggWasm: ogg.default as unknown as Uint8Array,
     };
-  })();
+  })().catch((err) => {
+    codecsPromise = null; // transient import failure (cold start): allow a retry
+    throw err;
+  });
   return codecsPromise;
 }
 
 const SERVICE_NAME = "SSDA";
-const VERSION = "2.6.1";
+const VERSION = "2.7.0";
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
@@ -216,6 +219,8 @@ async function streamUrlOf(track: ScTrack, cand: Candidate): Promise<string | nu
 /** Container sniffing from leading bytes of a segment / file. */
 function containerOf(bytes: Uint8Array): "fmp4" | "ogg" | "ts" | "mp3" | "wav" | "flac" | "unknown" {
   if (bytes.length >= 12 && ascii(bytes, 4, 8) === "ftyp") return "fmp4";
+  // HLS fMP4 segments start with styp/sidx/moof instead of ftyp
+  if (bytes.length >= 8 && (ascii(bytes, 4, 8) === "styp" || ascii(bytes, 4, 8) === "sidx" || ascii(bytes, 4, 8) === "moof")) return "fmp4";
   if (bytes.length >= 4 && ascii(bytes, 0, 4) === "OggS") return "ogg";
   if (bytes.length >= 189 && bytes[0] === 0x47 && bytes[188] === 0x47) return "ts";
   if (bytes.length >= 12 && ascii(bytes, 0, 4) === "RIFF" && ascii(bytes, 8, 12) === "WAVE") return "wav";
@@ -485,6 +490,8 @@ function trackMeta(track: ScTrack, sourceUrl: string) {
     artwork_url: track.artwork_url || null,
     permalink_url: track.permalink_url || sourceUrl,
     source_url: sourceUrl,
+    policy: track.policy ?? null,
+    snip: track.policy === "SNIP",
   };
 }
 
@@ -521,6 +528,25 @@ interface Candidate {
   kind: Kind;
   encrypted?: boolean;
   download?: boolean;
+  legacy?: boolean;
+}
+
+/**
+ * The old public stream endpoint. It still serves a plain MP3 for most
+ * tracks — including ones whose api-v2 renditions are HLS-only or
+ * DRM-wrapped — which is exactly what long-lived downloader tools use.
+ * Tried as a normal rendition; nothing is decrypted here.
+ */
+function legacyStreamCandidate(track: ScTrack): Candidate {
+  return {
+    transcoding: {
+      url: `https://api.soundcloud.com/tracks/${track.id}/stream`,
+      format: { protocol: "legacy", mime_type: "audio/mpeg" },
+      quality: "sq",
+    },
+    kind: "mp3",
+    legacy: true,
+  };
 }
 
 /** DRM-wrapped renditions (cbcs/cenc) never play outside a licensed player. */
@@ -581,8 +607,9 @@ function buildCandidates(track: ScTrack, fmt: string): Candidate[] {
     : fmt === "opus" ? ["opus", "m4a", "mp3", "hls"]
     : ["mp3", "m4a", "opus", "hls"]; // auto: smallest + most compatible first
 
-  // Three passes: clear renditions first, then the official download file,
-  // DRM-wrapped renditions last (they cannot play outside a licensed player).
+  // Passes: clear renditions first (with the legacy stream at the end of the
+  // mp3 class), then the official download file, DRM-wrapped renditions last
+  // (they cannot play outside a licensed player).
   const clear: Candidate[] = [];
   const encrypted: Candidate[] = [];
   for (const key of order) {
@@ -590,6 +617,7 @@ function buildCandidates(track: ScTrack, fmt: string): Candidate[] {
       const cand: Candidate = { transcoding: t, kind: key as Kind, encrypted: isEncrypted(t) };
       (cand.encrypted ? encrypted : clear).push(cand);
     }
+    if (key === "mp3") clear.push(legacyStreamCandidate(track));
   }
   const dlCands: Candidate[] = dl ? [{ transcoding: dl, kind: "other", download: true }] : [];
   return [...clear, ...dlCands, ...encrypted];
@@ -802,6 +830,30 @@ interface Rendered {
  * caller can try the next candidate.
  */
 async function renderCandidate(track: ScTrack, cand: Candidate): Promise<Rendered> {
+  if (cand.legacy) {
+    // Legacy public stream endpoint: a plain mp3 redirect, no media URL JSON.
+    let cid = await getClientId();
+    let bytes: Uint8Array | null = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const res = await fetch(`${cand.transcoding.url}?client_id=${cid}`, {
+        headers: { "User-Agent": UA },
+        redirect: "follow",
+        signal: AbortSignal.timeout(30000),
+      });
+      if (res.ok) {
+        bytes = new Uint8Array(await res.arrayBuffer());
+        break;
+      }
+      if (res.status !== 401 && res.status !== 403) break;
+      clientIdCache = null; // token rejected; retry once with a fresh client_id
+      cid = await getClientId();
+    }
+    if (!bytes) throw new ApiError(502, "upstream", "legacy stream endpoint did not return audio");
+    const container = containerOf(bytes);
+    const out = CONTAINER_OUT[container];
+    if (!out) throw new ApiError(415, "unsupported_container", `legacy stream is not playable audio (${container})`);
+    return { bytes, ext: out.ext, mime: out.mime, container };
+  }
   const streamUrl = await getStreamUrl(cand.transcoding, track);
   const proto = cand.transcoding.format?.protocol || "";
   const direct = cand.transcoding.url.includes("/stream/progressive") ||
@@ -911,10 +963,238 @@ function wavToPcm(bytes: Uint8Array): Pcm {
   return { channelData, sampleRate };
 }
 
+// ---- fMP4 (ISO-BMFF) -> ADTS AAC extraction -------------------------------
+// SoundCloud's HLS assemblies are fragmented MP4 whose segments start with
+// styp/moof boxes; decode-aac wants ADTS or raw frames. Demux the AAC frames
+// out (fragmented via trun, or progressive via stsz/stsc/stco) and re-wrap
+// them with ADTS headers.
+
+function mp4Boxes(bytes: Uint8Array, from: number, to: number): { type: string; start: number; end: number }[] {
+  const out: { type: string; start: number; end: number }[] = [];
+  let p = from;
+  while (p + 8 <= to) {
+    const dv = new DataView(bytes.buffer, bytes.byteOffset + p, 16);
+    let size = dv.getUint32(0);
+    const type = ascii(bytes, p + 4, p + 8);
+    let header = 8;
+    if (size === 1) {
+      if (p + 16 > to) break;
+      size = dv.getUint32(8) * 4294967296 + dv.getUint32(12);
+      header = 16;
+    } else if (size === 0) {
+      size = to - p;
+    }
+    if (size < header || p + size > to) break;
+    out.push({ type, start: p + header, end: p + size });
+    p += size;
+  }
+  return out;
+}
+
+function mp4Desc(buf: Uint8Array, pos: number): { tag: number; body: Uint8Array; next: number } {
+  const tag = buf[pos];
+  let len = 0;
+  let p = pos + 1;
+  let b = 0;
+  do {
+    b = buf[p++];
+    len = (len << 7) | (b & 0x7f);
+  } while ((b & 0x80) !== 0 && p < pos + 5);
+  return { tag, body: buf.subarray(p, p + len), next: p + len };
+}
+
+/** AudioSpecificConfig from an esds box body (skip 4-byte fullbox header). */
+function ascFromEsds(esds: Uint8Array): Uint8Array | null {
+  try {
+    const es = mp4Desc(esds, 4); // ES_Descriptor (0x03)
+    const dcfg = mp4Desc(es.body, 3); // skip ES_ID(2)+flags(1) -> DecoderConfig (0x04)
+    if (dcfg.tag !== 0x04) return null;
+    const dsi = mp4Desc(dcfg.body, 13); // skip 13 fixed bytes -> DecoderSpecificInfo (0x05)
+    return dsi.tag === 0x05 && dsi.body.length >= 2 ? dsi.body : null;
+  } catch {
+    return null;
+  }
+}
+
+function adtsHeader(frameLen: number, profile: number, sfi: number, ch: number): Uint8Array {
+  const h = new Uint8Array(7);
+  h[0] = 0xff;
+  h[1] = 0xf1;
+  h[2] = ((profile & 3) << 6) | ((sfi & 0x0f) << 2) | ((ch >> 2) & 1);
+  h[3] = ((ch & 3) << 6) | ((frameLen >> 11) & 3);
+  h[4] = (frameLen >> 3) & 0xff;
+  h[5] = ((frameLen & 7) << 5) | 0x1f;
+  h[6] = 0xfc;
+  return h;
+}
+
+function fmp4ToAdts(bytes: Uint8Array): Uint8Array {
+  const top = mp4Boxes(bytes, 0, bytes.length);
+
+  // ---- 1. AudioSpecificConfig from moov (stsd entry must be AAC) ----
+  let asc: Uint8Array | null = null;
+  const walk = (from: number, to: number) => {
+    for (const b of mp4Boxes(bytes, from, to)) {
+      if (["moov", "trak", "mdia", "minf", "stbl"].includes(b.type)) {
+        walk(b.start, b.end);
+      } else if (b.type === "stsd") {
+        for (const entry of mp4Boxes(bytes, b.start + 8, b.end)) {
+          if (entry.type !== "mp4a" && entry.type !== "enca") continue;
+          walk(entry.start + 28, entry.end); // sound sample entry body = 28 bytes
+        }
+      } else if (b.type === "esds") {
+        asc = asc ?? ascFromEsds(bytes.subarray(b.start, b.end));
+      }
+    }
+  };
+  for (const b of top) if (b.type === "moov") walk(b.start, b.end);
+  if (!asc) throw new ApiError(415, "unsupported_container", "fMP4 has no AAC decoder config");
+
+  const aot = (asc![0] >> 3) & 0x1f;
+  const sfi = ((asc![0] & 0x07) << 1) | (asc![1] >> 7);
+  const ch = (asc![1] >> 3) & 0x0f;
+  const profile = aot >= 1 && aot <= 4 ? aot - 1 : 1; // ADTS profile; HE-AAC streams as LC
+
+  // ---- 2. sample (offset, size) locations ----
+  const frames: Uint8Array[] = [];
+  const emit = (off: number, size: number) => {
+    if (size >= 1 && off + size <= bytes.length) {
+      frames.push(adtsHeader(size + 7, profile, sfi, ch), bytes.subarray(off, off + size));
+    }
+  };
+
+  // fragmented: each moof's trun sample sizes run through the following mdat
+  let pending: number[] = [];
+  for (const b of top) {
+    if (b.type === "moof") {
+      pending = [];
+      for (const traf of mp4Boxes(bytes, b.start, b.end)) {
+        if (traf.type !== "traf") continue;
+        let defaultSize = 0;
+        for (const t of mp4Boxes(bytes, traf.start, traf.end)) {
+          if (t.type === "tfhd") {
+            const flags = ((bytes[t.start + 1] << 16) | (bytes[t.start + 2] << 8) | bytes[t.start + 3]) >>> 0;
+            let p = t.start + 8; // version/flags(4) + track_ID(4)
+            if (flags & 0x01) p += 8; // base_data_offset
+            if (flags & 0x02) p += 4; // sample_description_index
+            if (flags & 0x08) p += 4; // default_sample_duration
+            if (flags & 0x10) p += 4; // default_sample_size
+            if (flags & 0x10) defaultSize = new DataView(bytes.buffer, bytes.byteOffset + p - 4, 4).getUint32(0);
+          } else if (t.type === "trun") {
+            const flags = ((bytes[t.start + 1] << 16) | (bytes[t.start + 2] << 8) | bytes[t.start + 3]) >>> 0;
+            const count = new DataView(bytes.buffer, bytes.byteOffset + t.start + 4, 4).getUint32(0);
+            let p = t.start + 8;
+            if (flags & 0x01) p += 4; // data_offset
+            if (flags & 0x04) p += 4; // first_sample_flags
+            for (let i = 0; i < count; i++) {
+              if (flags & 0x100) p += 4; // sample_duration
+              if (flags & 0x200) {
+                pending.push(new DataView(bytes.buffer, bytes.byteOffset + p, 4).getUint32(0));
+                p += 4;
+              } else {
+                pending.push(defaultSize);
+              }
+              if (flags & 0x400) p += 4; // sample_flags
+              if (flags & 0x800) p += 4; // composition_offset
+            }
+          }
+        }
+      }
+    } else if (b.type === "mdat" && pending.length) {
+      let payload = b.start; // box walk already skipped the size/type header
+      for (const size of pending) {
+        emit(payload, size);
+        payload += size;
+      }
+      pending = [];
+    }
+  }
+
+  // progressive mp4 (original m4a uploads): stsz sizes + stsc/stco chunk map
+  if (frames.length === 0) {
+    for (const b of top) {
+      if (b.type !== "moov") continue;
+      const walkProg = (from: number, to: number) => {
+        for (const box of mp4Boxes(bytes, from, to)) {
+          if (["moov", "trak", "mdia", "minf"].includes(box.type)) {
+            walkProg(box.start, box.end);
+          } else if (box.type === "stbl") {
+            const s: { sizes: number[]; chunkOffs: number[]; stscRuns: { firstChunk: number; samplesPerChunk: number }[] } = { sizes: [], chunkOffs: [], stscRuns: [] };
+            for (const t of mp4Boxes(bytes, box.start, box.end)) {
+              const dv = new DataView(bytes.buffer, bytes.byteOffset + t.start, 8);
+              if (t.type === "stsz") {
+                const fixed = dv.getUint32(4);
+                const count = dv.getUint32(8);
+                if (fixed !== 0) {
+                  for (let i = 0; i < count; i++) s.sizes.push(fixed);
+                } else {
+                  for (let i = 0; i < count; i++) s.sizes.push(new DataView(bytes.buffer, bytes.byteOffset + t.start + 12 + i * 4, 4).getUint32(0));
+                }
+              } else if (t.type === "stco" || t.type === "co64") {
+                const count = dv.getUint32(4);
+                for (let i = 0; i < count; i++) {
+                  if (t.type === "stco") s.chunkOffs.push(new DataView(bytes.buffer, bytes.byteOffset + t.start + 8 + i * 4, 4).getUint32(0));
+                  else {
+                    const dv2 = new DataView(bytes.buffer, bytes.byteOffset + t.start + 8 + i * 8, 8);
+                    s.chunkOffs.push(dv2.getUint32(0) * 4294967296 + dv2.getUint32(4));
+                  }
+                }
+              } else if (t.type === "stsc") {
+                const count = dv.getUint32(4);
+                for (let i = 0; i < count; i++) {
+                  const firstChunk = new DataView(bytes.buffer, bytes.byteOffset + t.start + 8 + i * 12, 4).getUint32(0);
+                  const samplesPerChunk = new DataView(bytes.buffer, bytes.byteOffset + t.start + 8 + i * 12 + 4, 4).getUint32(0);
+                  s.samplesPerChunk.push(samplesPerChunk);
+                  s.stscRuns.push({ firstChunk, samplesPerChunk });
+                }
+              }
+            }
+            // stsc: runs of (first_chunk, samples_per_chunk); expand to per-chunk counts
+            if (s.sizes.length && s.chunkOffs.length) {
+              let sample = 0;
+              for (let c = 0; c < s.chunkOffs.length && sample < s.sizes.length; c++) {
+                const chunkNumber = c + 1; // stsc first_chunk is 1-based
+                let n = s.stscRuns.length ? s.stscRuns[0].samplesPerChunk : 1;
+                for (const run of s.stscRuns) if (chunkNumber >= run.firstChunk) n = run.samplesPerChunk;
+                let off = s.chunkOffs[c];
+                for (let k = 0; k < n && sample < s.sizes.length; k++) {
+                  emit(off, s.sizes[sample]);
+                  off += s.sizes[sample];
+                  sample++;
+                }
+              }
+            }
+          }
+        }
+      };
+      walkProg(b.start, b.end);
+    }
+  }
+
+  if (!frames.length) throw new ApiError(415, "unsupported_container", "fMP4 demux found no AAC frames");
+  return concatBytes(frames);
+}
+
 async function decodeToPcm(bytes: Uint8Array, ext: string): Promise<Pcm> {
   const codecs = await loadCodecs();
   if (ext === "mp3") return await codecs.decodeMp3(bytes);
-  if (ext === "m4a" || ext === "aac") return await codecs.decodeAac(bytes);
+  if (ext === "m4a" || ext === "aac") {
+    const tryDecode = async (b: Uint8Array): Promise<Pcm | null> => {
+      try {
+        const pcm = await codecs.decodeAac(b);
+        return pcm.channelData.length && pcm.channelData[0]?.length ? pcm : null;
+      } catch {
+        return null;
+      }
+    };
+    // direct decode works for plain ADTS and simple fMP4
+    const direct = await tryDecode(bytes);
+    if (direct) return direct;
+    // styp-headed HLS assemblies and other odd fMP4 need an explicit demux
+    const demuxed = await tryDecode(fmp4ToAdts(bytes));
+    if (demuxed) return demuxed;
+    throw new ApiError(415, "unsupported_container", "decoded audio is empty");
+  }
   if (ext === "wav") return wavToPcm(bytes);
   throw new ApiError(415, "unsupported_container", `cannot convert audio from '${ext}'`);
 }
@@ -962,7 +1242,12 @@ async function encodeOpus(pcm: Pcm): Promise<Uint8Array> {
 }
 
 async function convertAudio(bytes: Uint8Array, srcExt: string, fmt: string): Promise<Rendered> {
-  const codecs = await loadCodecs();
+  let codecs: Awaited<ReturnType<typeof loadCodecs>>;
+  try {
+    codecs = await loadCodecs();
+  } catch {
+    codecs = await loadCodecs(); // transient import failure (cold start): retry once
+  }
   const pcm = await decodeToPcm(bytes, srcExt);
   if (!pcm.channelData.length || !pcm.channelData[0]?.length) {
     throw new ApiError(415, "unsupported_container", "decoded audio is empty");
@@ -1040,13 +1325,14 @@ async function serveAudio(url: string, fmt: string, attachment: boolean): Promis
         status: 200,
         headers: audioHeaders(meta, out.ext, out.mime, `converted from ${source.ext} to ${out.ext}`, attachment, out.bytes.length),
       });
-    } catch {
-      // Conversion unsupported for this source: serve the rendition as-is.
-      const note = `no ${fmt} rendition available; returning ${source.ext}`;
-      return new Response(source.bytes, {
-        status: 200,
-        headers: audioHeaders(meta, source.ext, source.mime, note, attachment, source.bytes.length),
-      });
+    } catch (err) {
+      // Never silently hand back the wrong format when one was requested.
+      const why = err instanceof ApiError || err instanceof Error ? err.message : String(err);
+      throw new ApiError(
+        415,
+        "conversion_failed",
+        `This track has no ${fmt} rendition and conversion from ${source.ext} failed (${why}). Try format=auto to get the file as-is.`,
+      );
     }
   }
 
