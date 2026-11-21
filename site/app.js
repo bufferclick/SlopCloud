@@ -1,11 +1,17 @@
 /*
- * SlopCloud site UI. Depends on slopcloud.js (window.SlopCloud) and an SSDA
- * API server for fetching audio (see ssda/ in the repository).
+ * SlopCloud site UI. Depends on slopcloud.js (window.SlopCloud) and the SSDA
+ * API (Supabase Edge Function, see supabase/functions/ssda in the repository).
  */
 (function () {
   'use strict';
 
   function $(id) { return document.getElementById(id); }
+
+  // SSDA API — runs as a Supabase Edge Function inside the SlopCloud project.
+  // Override with localStorage.setItem('ssda.api', 'http://localhost:8787') for
+  // local development; blank nothing to configure for normal use.
+  var API_BASE = localStorage.getItem('ssda.api') ||
+    'https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/ssda';
 
   var els = {
     form: $('add-form'),
@@ -21,10 +27,6 @@
     songsCount: $('songs-count'),
     storageInfo: $('storage-info'),
     clearBtn: $('clear-btn'),
-    apiInput: $('api-input'),
-    apiSaveBtn: $('api-save-btn'),
-    apiStatus: $('api-status'),
-    apiDetails: $('api-details'),
     player: $('player'),
     playerTitle: $('player-title'),
     playerArtist: $('player-artist'),
@@ -35,7 +37,6 @@
   };
 
   var state = {
-    apiBase: localStorage.getItem('ssda.api') || '',
     songs: [],
     playingId: null,
     objectUrl: null,
@@ -116,12 +117,10 @@
   // ---------- API status ----------
 
   function apiUrl(path) {
-    return state.apiBase.replace(/\/+$/, '') + path;
+    return API_BASE.replace(/\/+$/, '') + path;
   }
 
   function checkApi() {
-    els.apiStatus.textContent = 'checking…';
-    els.apiStatus.className = 'pill unknown';
     var ctrl = new AbortController();
     var timer = setTimeout(function () { ctrl.abort(); }, 6000);
     fetch(apiUrl('/api/health'), { signal: ctrl.signal })
@@ -129,18 +128,10 @@
       .then(function (data) {
         clearTimeout(timer);
         if (!data.ok) throw new Error('bad health response');
-        els.apiStatus.textContent = data.demo ? 'connected (demo mode)' : 'connected';
-        els.apiStatus.className = 'pill ok';
-        if (data.demo) {
-          els.apiDetails.open = true;
-          setStatus('API is in demo mode: it serves generated tones instead of real SoundCloud audio.');
-        }
       })
       .catch(function () {
         clearTimeout(timer);
-        els.apiStatus.textContent = 'not reachable';
-        els.apiStatus.className = 'pill bad';
-        els.apiDetails.open = true;
+        setStatus('The SSDA API is not reachable right now. Saving and downloading songs will not work.', 'error');
       });
   }
 
@@ -327,7 +318,7 @@
     setStatus('Fetching track info…');
     showProgress(0, 0);
     try {
-      var record = await SlopCloud.fetchAndCache(state.apiBase, url, {
+      var record = await SlopCloud.fetchAndCache(API_BASE, url, {
         format: els.format.value,
         onProgress: showProgress,
       });
@@ -408,13 +399,6 @@
     downloadToFiles();
   });
 
-  els.apiSaveBtn.addEventListener('click', function () {
-    state.apiBase = els.apiInput.value.trim();
-    localStorage.setItem('ssda.api', state.apiBase);
-    checkApi();
-    setStatus('API URL saved.');
-  });
-
   els.clearBtn.addEventListener('click', async function () {
     if (!state.songs.length) return;
     if (!confirm('Delete all cached songs from this site?')) return;
@@ -492,7 +476,6 @@
   }
 
   async function boot() {
-    els.apiInput.value = state.apiBase;
     checkApi();
     try {
       await SlopCloud.init();

@@ -56,26 +56,6 @@
     <p id="empty-note" class="muted empty-note">No cached songs yet.</p>
   </section>
 
-  <section class="card" aria-labelledby="api-h">
-    <details id="api-details">
-      <summary id="api-h">SSDA API settings</summary>
-      <div class="api-body">
-        <label for="api-input">API base URL</label>
-        <div class="row">
-          <input id="api-input" type="url" spellcheck="false"
-                 placeholder="https://your-ssda-server.example (blank = this site's origin)">
-          <button type="button" id="api-save-btn" class="btn small">Save</button>
-        </div>
-        <p class="status-line">Status: <span id="api-status" class="pill unknown">checking…</span></p>
-        <p class="muted">
-          GitHub Pages serves static files only. Run the SSDA server (see <code>ssda/</code> in the
-          repository) on any host that allows outbound internet, then paste its URL above.
-          The same origin is used automatically when the API is served alongside this site.
-        </p>
-      </div>
-    </details>
-  </section>
-
   <footer>
     <p>Audio is stored in this site's browser cache and plays from memory. Clearing this site's
     stored data deletes the songs. Download only audio you are allowed to download.</p>
