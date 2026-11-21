@@ -1,0 +1,6 @@
+# Supabase project configuration (see https://supabase.com/docs/guides/local-development)
+# The SSDA API is deployed as the Edge Function below:
+#   https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/ssda
+
+[functions.ssda]
+verify_jwt = false
