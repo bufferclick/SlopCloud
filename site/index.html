@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SlopCloud</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main class="wrap">
+
+  <header>
+    <h1>SlopCloud</h1>
+    <p class="sub">SoundCloud song cache and player. Songs are stored in this site's browser cache.</p>
+  </header>
+
+  <section class="card" aria-labelledby="add-h">
+    <h2 id="add-h">Add a song</h2>
+    <form id="add-form">
+      <label for="url-input">SoundCloud link</label>
+      <div class="row">
+        <input id="url-input" type="url" inputmode="url" spellcheck="false"
+               placeholder="https://on.soundcloud.com/..." required>
+      </div>
+      <div class="row controls">
+        <label class="inline" for="format-select">Format
+          <select id="format-select">
+            <option value="auto" selected>auto (smallest, same quality)</option>
+            <option value="m4a">m4a</option>
+            <option value="mp3">mp3</option>
+            <option value="opus">opus</option>
+          </select>
+        </label>
+        <div class="btn-group">
+          <button type="submit" id="save-btn" class="btn primary">Save to cache</button>
+          <button type="button" id="file-btn" class="btn">Download song to files</button>
+        </div>
+      </div>
+    </form>
+
+    <div id="progress-wrap" class="progress-wrap hidden">
+      <div id="progress-bar" class="progress-bar"></div>
+    </div>
+    <p id="status" class="status" role="status"></p>
+  </section>
+
+  <section class="card" aria-labelledby="songs-h">
+    <div class="songs-head">
+      <h2 id="songs-h">Cached songs <span id="songs-count" class="count"></span></h2>
+      <div class="songs-tools">
+        <span id="storage-info" class="muted"></span>
+        <button type="button" id="clear-btn" class="btn small danger">Delete all cached songs</button>
+      </div>
+    </div>
+    <ul id="song-list" class="song-list"></ul>
+    <p id="empty-note" class="muted empty-note">No cached songs yet.</p>
+  </section>
+
+  <section class="card" aria-labelledby="api-h">
+    <details id="api-details">
+      <summary id="api-h">SSDA API settings</summary>
+      <div class="api-body">
+        <label for="api-input">API base URL</label>
+        <div class="row">
+          <input id="api-input" type="url" spellcheck="false"
+                 placeholder="https://your-ssda-server.example (blank = this site's origin)">
+          <button type="button" id="api-save-btn" class="btn small">Save</button>
+        </div>
+        <p class="status-line">Status: <span id="api-status" class="pill unknown">checking…</span></p>
+        <p class="muted">
+          GitHub Pages serves static files only. Run the SSDA server (see <code>ssda/</code> in the
+          repository) on any host that allows outbound internet, then paste its URL above.
+          The same origin is used automatically when the API is served alongside this site.
+        </p>
+      </div>
+    </details>
+  </section>
+
+  <footer>
+    <p>Audio is stored in this site's browser cache and plays from memory. Clearing this site's
+    stored data deletes the songs. Download only audio you are allowed to download.</p>
+  </footer>
+</main>
+
+<div id="player" class="player hidden">
+  <div class="player-info">
+    <div id="player-title" class="player-title">–</div>
+    <div id="player-artist" class="player-artist muted">–</div>
+  </div>
+  <button type="button" id="player-toggle" class="btn icon" aria-label="Pause">⏸</button>
+  <input id="player-seek" type="range" min="0" max="1000" value="0" step="1" aria-label="Seek">
+  <span id="player-time" class="player-time muted">0:00 / 0:00</span>
+  <button type="button" id="player-close" class="btn icon" aria-label="Close player">✕</button>
+</div>
+
+<script src="slopcloud.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
