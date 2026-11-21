@@ -22,8 +22,11 @@ Repository layout:
    `https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/ssda`.
 2. SSDA resolves the SoundCloud link server-side and passes the audio through
    **without re-encoding**, so quality is exactly what the uploader provided.
-   `format=auto` keeps full source quality and prefers the most storage-efficient
-   rendition (opus, then m4a, then mp3).
+   `format=auto` prefers the progressive mp3 (smallest standard rendition,
+   plays everywhere), then m4a (AAC), then opus. Some tracks are only offered
+   as DRM-wrapped streams that cannot play outside a licensed player; for
+   those, when the artist allows downloads, the official download file is
+   served instead.
 3. The SlopCloud API in the browser stores the bytes in the site's own cache
    (Cache API) and the track info in IndexedDB. The song is now in the website,
    not in your downloads folder. Clear this site's stored data and the songs are
@@ -49,9 +52,15 @@ GET /api/download?url=<link>                 audio bytes as a file download
 
 - `url` must be a SoundCloud link (`soundcloud.com`, `on.soundcloud.com`,
   `snd.sc`); short links are resolved. Playlists and profiles are rejected.
+- `format=auto` picks the progressive mp3 first, then m4a, then opus; an
+  explicit `format` prefers that rendition and falls back to the closest one.
 - Audio responses carry `X-SSDA-Extension` and a `Content-Disposition` filename
   (`Artist - Title.ext`). When the requested format does not exist for a track,
   the closest rendition is served and `X-SSDA-Format-Note` explains.
+- Renditions are container-validated before serving: HLS fMP4/Ogg are
+  assembled as-is, MPEG-TS is demuxed to ADTS AAC, DRM-wrapped (cbcs/cenc)
+  streams are skipped, and the artist's official download file is used when
+  that is the only playable audio.
 - CORS is open (`Access-Control-Allow-Origin: *`), so any website can use it.
 - Errors are JSON: `{"error": {"code": "...", "message": "..."}}`.
 
@@ -75,7 +84,8 @@ python3 -m http.server 8000 --directory site
 node tools/test-ssda.mjs
 ```
 
-32 tests covering routing, format selection, HLS assembly, error shapes, CORS,
+43 tests covering routing, format selection, HLS assembly, container
+validation, DRM handling, the official-download fallback, error shapes, CORS,
 and resilience (challenge-page retries, flaky upstream, oEmbed fallback) — all
 against a mocked SoundCloud, no network needed.
 
@@ -87,5 +97,6 @@ against a mocked SoundCloud, no network needed.
 - Keep the audio you are allowed to keep: your own uploads, tracks the artist
   offers for download, Creative Commons licensed audio, and so on. Respect
   SoundCloud's terms and copyright law.
-- The API retries through SoundCloud's occasional bot-challenge pages, but a
-  heavily blocked request returns a clear error — trying again usually works.
+- The API retries through SoundCloud's occasional bot-challenge pages and
+  region-dependent responses, but a heavily blocked request returns a clear
+  error — trying again usually works.

@@ -6,12 +6,17 @@
 //   GET /api/audio?url=<link>&format=auto|m4a|mp3|opus   audio bytes
 //   GET /api/download?url=<link>         audio bytes as a file download
 //
-// Audio is passed through without re-encoding: quality is exactly the source.
-// format=auto keeps full source quality and prefers the most storage-efficient
-// rendition (opus, then m4a, then mp3).
+// Audio is passed through without re-encoding whenever possible: quality is
+// exactly what the uploader provided. format=auto prefers the progressive mp3
+// (smallest standard rendition, plays everywhere), then m4a (AAC/fMP4), then
+// opus. HLS output is container-validated before serving: fMP4 and Ogg are
+// assembled as-is; MPEG-TS streams are demuxed to ADTS AAC; anything else is
+// skipped rather than served broken. DRM-wrapped renditions (cbcs/cenc) are
+// skipped when possible; when the artist allows downloads, the official
+// download file is served instead.
 
 const SERVICE_NAME = "SSDA";
-const VERSION = "2.3.0";
+const VERSION = "2.5.1";
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
@@ -146,6 +151,42 @@ async function fetchBytes(url: string, tries = 3): Promise<Uint8Array> {
   throw lastErr;
 }
 
+function ascii(b: Uint8Array, from: number, to: number): string {
+  return String.fromCharCode(...b.slice(from, to));
+}
+
+function hexPreview(bytes: Uint8Array, n = 24): string {
+  return Array.from(bytes.slice(0, n)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** Resolved media URL for a candidate (used by diagnostics only). */
+async function streamUrlOf(track: ScTrack, cand: Candidate): Promise<string | null> {
+  try {
+    return await getStreamUrl(cand.transcoding, track);
+  } catch {
+    return null;
+  }
+}
+
+/** Container sniffing from leading bytes of a segment / file. */
+function containerOf(bytes: Uint8Array): "fmp4" | "ogg" | "ts" | "mp3" | "wav" | "flac" | "unknown" {
+  if (bytes.length >= 12 && ascii(bytes, 4, 8) === "ftyp") return "fmp4";
+  if (bytes.length >= 4 && ascii(bytes, 0, 4) === "OggS") return "ogg";
+  if (bytes.length >= 189 && bytes[0] === 0x47 && bytes[188] === 0x47) return "ts";
+  if (bytes.length >= 12 && ascii(bytes, 0, 4) === "RIFF" && ascii(bytes, 8, 12) === "WAVE") return "wav";
+  if (bytes.length >= 4 && ascii(bytes, 0, 4) === "fLaC") return "flac";
+  if (bytes.length >= 3 && (ascii(bytes, 0, 3) === "ID3" || (bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0))) return "mp3";
+  return "unknown";
+}
+
+const CONTAINER_OUT: Record<string, { ext: string; mime: string }> = {
+  mp3: { ext: "mp3", mime: "audio/mpeg" },
+  fmp4: { ext: "m4a", mime: "audio/mp4" },
+  ogg: { ext: "opus", mime: "audio/ogg" },
+  wav: { ext: "wav", mime: "audio/wav" },
+  flac: { ext: "flac", mime: "audio/flac" },
+};
+
 // ---------------------------------------------------------------- client_id
 
 let clientIdCache: { id: string; at: number } | null = null;
@@ -185,11 +226,9 @@ async function scanPageForClientId(page: string): Promise<string | null> {
   if (!res.ok) return null;
   const html = await res.text();
 
-  // sometimes embedded directly in the page
   const inline = findClientId(html);
   if (inline) return inline;
 
-  // JS asset bundles: full or protocol-relative URLs on sndcdn.com
   const assets = [...new Set(
     [...html.matchAll(/(?:https?:)?\/\/(?:[a-z0-9-]+\.)?sndcdn\.com\/assets\/[A-Za-z0-9._-]+\.js/g)]
       .map((m) => (m[0].startsWith("//") ? "https:" + m[0] : m[0])),
@@ -255,6 +294,9 @@ interface ScTrack {
   permalink_url?: string;
   artwork_url?: string | null;
   policy?: string;
+  track_authorization?: string | null;
+  downloadable?: boolean;
+  has_downloads_left?: number;
   user?: { username?: string };
   publisher_metadata?: { artist?: string | null };
   media?: { transcodings?: Transcoding[] };
@@ -285,46 +327,59 @@ async function resolveTrack(inputUrl: string): Promise<ScTrack> {
     }
   }
 
-  let cid = await getClientId();
-  const resolveOnce = (id: string) =>
-    fetch(
+  const resolveOnce = async (id: string) => {
+    const res = await fetch(
       `https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(target)}&client_id=${id}`,
       { headers: { Accept: "application/json", "User-Agent": UA }, signal: AbortSignal.timeout(20000) },
     );
+    return res;
+  };
 
-  let res = await resolveOnce(cid);
-  if (res.status === 401 || res.status === 403) {
-    // stale client_id -> refresh once
-    clientIdCache = null;
-    cid = await getClientId();
-    res = await resolveOnce(cid);
-  }
+  // SoundCloud's answer varies between requests (region/entitlement roulette:
+  // the same track can come back with policy=BLOCK and no renditions, or fully
+  // playable). Try a few times before believing a negative answer.
+  let data: Record<string, unknown> | null = null;
+  let lastStatus = 0;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) {
+      clientIdCache = null;
+      await sleep(400 * attempt);
+    }
+    let cid = await getClientId();
+    let res = await resolveOnce(cid);
+    lastStatus = res.status;
+    if (res.status === 401 || res.status === 403) {
+      clientIdCache = null;
+      cid = await getClientId();
+      res = await resolveOnce(cid);
+      lastStatus = res.status;
+    }
+    if (res.status === 404) {
+      throw new ApiError(404, "track_not_found", "No SoundCloud track found at this link.");
+    }
+    if (res.status === 429) {
+      throw new ApiError(429, "rate_limited", "SoundCloud is rate-limiting requests. Try again shortly.");
+    }
+    if (!res.ok) continue;
 
-  if (res.status === 404) {
-    throw new ApiError(404, "track_not_found", "No SoundCloud track found at this link.");
-  }
-  if (res.status === 429) {
-    throw new ApiError(429, "rate_limited", "SoundCloud is rate-limiting requests. Try again shortly.");
-  }
-  if (!res.ok) {
-    throw new ApiError(502, "upstream", `SoundCloud resolve failed (HTTP ${res.status}).`);
-  }
-
-  const data = await res.json();
-  if (!data || (data.kind && data.kind !== "track")) {
-    throw new ApiError(400, "not_a_track", "This link is not a single track (playlists and profiles are not supported).");
-  }
-  // SoundCloud intermittently omits renditions in the resolve response;
-  // one retry avoids falsely reporting a streamable track as restricted.
-  if (!data.media?.transcodings?.length && data.policy !== "BLOCK" && data.policy !== "SNIP") {
-    await sleep(500);
-    const again = await resolveOnce(cid);
-    if (again.ok) {
-      const retry = await again.json();
-      if (retry?.media?.transcodings?.length) return retry as ScTrack;
+    const body = await res.json();
+    if (!body || (body.kind && body.kind !== "track")) {
+      throw new ApiError(400, "not_a_track", "This link is not a single track (playlists and profiles are not supported).");
+    }
+    if (body.media?.transcodings?.length) {
+      data = body;
+      break;
+    }
+    data = data ?? body; // keep the (rendition-less) body as fallback
+    if (body.policy === "BLOCK" || body.policy === "SNIP" || body.policy === "WAIT") {
+      continue; // retry: sometimes the next answer has renditions
     }
   }
-  return data as ScTrack;
+
+  if (!data) {
+    throw new ApiError(502, "upstream", `SoundCloud resolve failed (HTTP ${lastStatus}).`);
+  }
+  return data as unknown as ScTrack;
 }
 
 function trackMeta(track: ScTrack, sourceUrl: string) {
@@ -366,83 +421,115 @@ async function infoFallback(link: string) {
   }
 }
 
-// ---------------------------------------------------------------- formats
+// ---------------------------------------------------------------- renditions
 
-interface Picked {
+type Kind = "mp3" | "m4a" | "opus" | "hls" | "other";
+
+interface Candidate {
   transcoding: Transcoding;
-  ext: string;
-  mime: string;
-  note: string | null;
+  kind: Kind;
+  encrypted?: boolean;
+  download?: boolean;
 }
 
-type Kind = "mp3" | "m4a" | "opus" | "other";
+/** DRM-wrapped renditions (cbcs/cenc) never play outside a licensed player. */
+function isEncrypted(t: Transcoding): boolean {
+  const proto = (t.format?.protocol || "").toLowerCase();
+  return proto.includes("encrypted") || (t.url || "").includes("/cbcs/") || (t.url || "").includes("/cenc/");
+}
 
-const KIND_INFO: Record<Kind, [string, string]> = {
-  mp3: ["mp3", "audio/mpeg"],
-  m4a: ["m4a", "audio/mp4"],
-  opus: ["opus", "audio/ogg"],
-  other: ["bin", "application/octet-stream"],
-};
+/** The official download button's file (original upload), when the artist allows it. */
+function downloadTranscoding(track: ScTrack): Transcoding | null {
+  if (!track.downloadable) return null;
+  if (typeof track.has_downloads_left === "number" && track.has_downloads_left <= 0) return null;
+  return {
+    url: `https://api-v2.soundcloud.com/tracks/${track.id}/download`,
+    format: { protocol: "download", mime_type: "" },
+    quality: "sq",
+  };
+}
 
-/** Classify a rendition by its stream URL first (most reliable), then mime. */
+/**
+ * Classify a rendition. Real audio mimes are reliable; the stream URL breaks
+ * ties; 'audio/mpegurl' renditions are playlist-ish and only used as a last
+ * resort (they are ordered as generic 'hls').
+ */
 function classifyTranscoding(t: Transcoding): Kind {
-  const u = t.url || "";
   const mime = (t.format?.mime_type || "").toLowerCase();
-  const protocol = (t.format?.protocol || "").toLowerCase();
-  if (u.includes("/stream/progressive") || (protocol === "progressive" && mime.includes("mpeg"))) return "mp3";
-  if (u.includes("/stream/hls/aac") || mime.startsWith("audio/mp4") || mime.includes("mp4a")) return "m4a";
-  if (u.includes("/stream/hls") || mime.startsWith("audio/ogg") || mime.includes("opus")) return "opus";
+  const u = t.url || "";
+  if (mime.startsWith("audio/mpeg/") || (mime.startsWith("audio/mpeg") && !mime.startsWith("audio/mpegurl"))) return "mp3";
+  if (mime.startsWith("audio/mp4") || mime.includes("mp4a")) return "m4a";
+  if (mime.startsWith("audio/ogg") || mime.includes("opus")) return "opus";
+  if (u.includes("/stream/progressive")) return "mp3";
+  if (u.includes("/stream/hls/aac")) return "m4a";
+  if (u.includes("/stream/hls")) return "hls";
   return "other";
 }
 
-function pickedFrom(t: Transcoding, note: string | null): Picked {
-  const [ext, mime] = KIND_INFO[classifyTranscoding(t)];
-  return { transcoding: t, ext, mime, note };
-}
-
-function pickTranscoding(track: ScTrack, fmt: string): Picked {
-  const list: Transcoding[] = track.media?.transcodings ?? [];
-  if (list.length === 0) {
+function buildCandidates(track: ScTrack, fmt: string): Candidate[] {
+  const list = track.media?.transcodings ?? [];
+  const dl = downloadTranscoding(track);
+  if (list.length === 0 && !dl) {
     throw new ApiError(
       403,
       "not_streamable",
-      "This track cannot be streamed (restricted, or only available with a Go+ subscription).",
+      "This track cannot be streamed (restricted, or only available with a Go+ subscription). If you just tried again shortly, the track may work on a retry.",
     );
   }
-  const byKind = (kind: Kind) => list.find((t) => classifyTranscoding(t) === kind);
-  const orNote = (t: Transcoding | undefined, note: string | null): Picked | null =>
-    t ? pickedFrom(t, note) : null;
+  const by = (kind: Kind) => list.filter((t) => classifyTranscoding(t) === kind);
+  const buckets: Record<string, Transcoding[]> = {
+    mp3: by("mp3"),
+    m4a: by("m4a"),
+    opus: by("opus"),
+    hls: by("hls").concat(by("other")),
+  };
 
-  const opus = byKind("opus");
-  const aac = byKind("m4a");
-  const mp3 = byKind("mp3");
-  const any = list[0];
+  const order: string[] =
+    fmt === "mp3" ? ["mp3", "m4a", "opus", "hls"]
+    : fmt === "m4a" ? ["m4a", "mp3", "opus", "hls"]
+    : fmt === "opus" ? ["opus", "m4a", "mp3", "hls"]
+    : ["mp3", "m4a", "opus", "hls"]; // auto: smallest + most compatible first
 
-  let picked: Picked | null = null;
-  if (fmt === "mp3") {
-    picked = orNote(mp3, null) ||
-      orNote(opus, "no mp3 rendition available; returning opus") ||
-      orNote(aac, "no mp3 rendition available; returning m4a");
-  } else if (fmt === "m4a") {
-    picked = orNote(aac, null) ||
-      orNote(mp3, "no m4a rendition available; returning mp3") ||
-      orNote(opus, "no m4a rendition available; returning opus");
-  } else if (fmt === "opus") {
-    picked = orNote(opus, null) ||
-      orNote(aac, "no opus rendition available; returning m4a") ||
-      orNote(mp3, "no opus rendition available; returning mp3");
-  } else {
-    // auto: full source quality, most storage-efficient codec first
-    picked = orNote(opus, null) ||
-      orNote(aac, null) ||
-      orNote(mp3, null) ||
-      orNote(any, null);
+  // Three passes: clear renditions first, then the official download file,
+  // DRM-wrapped renditions last (they cannot play outside a licensed player).
+  const clear: Candidate[] = [];
+  const encrypted: Candidate[] = [];
+  for (const key of order) {
+    for (const t of buckets[key] ?? []) {
+      const cand: Candidate = { transcoding: t, kind: key as Kind, encrypted: isEncrypted(t) };
+      (cand.encrypted ? encrypted : clear).push(cand);
+    }
   }
+  const dlCands: Candidate[] = dl ? [{ transcoding: dl, kind: "other", download: true }] : [];
+  return [...clear, ...dlCands, ...encrypted];
+}
 
-  if (!picked) {
-    throw new ApiError(403, "not_streamable", "No usable audio rendition found for this track.");
+// ---------------------------------------------------------------- media url
+
+async function getStreamUrl(transcoding: Transcoding, track?: ScTrack): Promise<string> {
+  let lastStatus = 0;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const cid = await getClientId();
+    const u = new URL(transcoding.url);
+    if (!u.searchParams.has("client_id")) u.searchParams.set("client_id", cid);
+    const ta = track?.track_authorization;
+    if (ta && !u.searchParams.has("track_authorization")) {
+      u.searchParams.set("track_authorization", ta);
+    }
+    const res = await fetch(u.href, {
+      headers: { Accept: "application/json", "User-Agent": UA },
+      signal: AbortSignal.timeout(20000),
+    });
+    lastStatus = res.status;
+    if (res.ok) {
+      const data = await res.json();
+      if (data?.url) return data.url;
+    } else if (res.status !== 401 && res.status !== 403 && res.status !== 404) {
+      break; // not a token problem; retrying will not help
+    }
+    clientIdCache = null;
   }
-  return picked;
+  throw new ApiError(502, "upstream", `Could not get the audio stream URL (HTTP ${lastStatus}).`);
 }
 
 // ---------------------------------------------------------------- hls
@@ -464,23 +551,27 @@ function firstVariant(text: string, baseUrl: string): string | null {
   return null;
 }
 
-function parseMediaPlaylist(text: string, baseUrl: string): { init: string | null; segments: string[] } {
+function parseMediaPlaylist(text: string, baseUrl: string): { init: string | null; segments: string[]; key: string | null } {
   let init: string | null = null;
+  let key: string | null = null;
   const segments: string[] = [];
   for (const raw of text.split(/\r?\n/)) {
     const line = raw.trim();
     if (!line) continue;
-    if (line.startsWith("#EXT-X-MAP:")) {
+    if (line.startsWith("#EXT-X-KEY:") || line.startsWith("#EXT-X-SESSION-KEY:")) {
+      key = key ?? line;
+    } else if (line.startsWith("#EXT-X-MAP:")) {
       const m = line.match(/URI="([^"]+)"/);
       if (m) init = new URL(m[1], baseUrl).href;
     } else if (!line.startsWith("#")) {
       segments.push(new URL(line, baseUrl).href);
     }
   }
-  return { init, segments };
+  return { init, segments, key };
 }
 
-async function downloadHls(playlistUrl: string): Promise<Uint8Array> {
+/** Download an HLS rendition: returns all parts and the sniffed container. */
+async function assembleHls(playlistUrl: string): Promise<{ bytes: Uint8Array; container: string; key: string | null; debug: Record<string, unknown> }> {
   const head = await fetch(playlistUrl, {
     headers: { "User-Agent": UA },
     signal: AbortSignal.timeout(20000),
@@ -501,8 +592,12 @@ async function downloadHls(playlistUrl: string): Promise<Uint8Array> {
     baseUrl = variant;
   }
 
-  const { init, segments } = parseMediaPlaylist(text, baseUrl);
+  const { init, segments, key } = parseMediaPlaylist(text, baseUrl);
   if (segments.length === 0) throw new ApiError(502, "upstream", "HLS playlist has no segments.");
+  if (key) {
+    // fail fast: no point downloading segments we cannot play
+    throw new ApiError(415, "drm_protected", `rendition is DRM-encrypted (${key.slice(0, 80)})`);
+  }
 
   const urls = (init ? [init] : []).concat(segments);
   const parts: Uint8Array[] = [];
@@ -512,25 +607,78 @@ async function downloadHls(playlistUrl: string): Promise<Uint8Array> {
     const got = await Promise.all(batch.map((u) => fetchBytes(u)));
     parts.push(...got);
   }
-  return concatBytes(parts);
+  return {
+    bytes: concatBytes(parts),
+    container: containerOf(parts[0]),
+    key,
+    debug: {
+      playlist: text.slice(0, 2500),
+      init_present: Boolean(init),
+      segment_count: segments.length,
+    },
+  };
 }
 
-// ---------------------------------------------------------------- audio
+// ---------------------------------------------------------------- ts -> adts
 
-async function getStreamUrl(transcoding: Transcoding): Promise<string> {
-  const cid = await getClientId();
-  const joiner = transcoding.url.includes("?") ? "&" : "?";
-  const res = await fetch(`${transcoding.url}${joiner}client_id=${cid}`, {
-    headers: { Accept: "application/json", "User-Agent": UA },
-    signal: AbortSignal.timeout(20000),
-  });
-  if (!res.ok) throw new ApiError(502, "upstream", `Could not get the audio stream URL (HTTP ${res.status}).`);
-  const data = await res.json();
-  if (!data?.url) throw new ApiError(502, "upstream", "SoundCloud returned no stream URL.");
-  return data.url;
+/** Demux MPEG-TS carrying AAC into a raw ADTS stream (playable as .aac). */
+function tsToAdts(ts: Uint8Array): Uint8Array | null {
+  const payloads = new Map<number, number[]>();
+  let audioPid = -1;
+
+  for (let off = 0; off + 188 <= ts.length; off += 188) {
+    if (ts[off] !== 0x47) continue;
+    const pid = ((ts[off + 1] & 0x1f) << 8) | ts[off + 2];
+    const pusi = (ts[off + 1] & 0x40) !== 0;
+    const afc = (ts[off + 3] >> 4) & 0x03;
+    if (afc === 0 || afc === 1) {
+      var payloadOff = off + 4;
+    } else {
+      const afl = ts[off + 4];
+      payloadOff = off + 5 + afl;
+    }
+    if (payloadOff >= off + 188) continue;
+    const payload = ts.slice(payloadOff, off + 188);
+
+    if (pusi && payload.length >= 4 && payload[0] === 0x00 && payload[1] === 0x00 && payload[2] === 0x01) {
+      const streamId = payload[3];
+      if (streamId >= 0xc0 && streamId <= 0xdf) audioPid = pid; // MPEG audio / AAC
+      if (audioPid === -1 && streamId === 0xbd) audioPid = pid; // private stream (AC3/AAC)
+    }
+    if (pid !== audioPid || audioPid === -1) continue;
+
+    if (pusi && payload.length >= 9) {
+      const headerLen = 9 + payload[8];
+      const chunk = payload.slice(headerLen);
+      (payloads.get(pid) ?? payloads.set(pid, []).get(pid)!).push(...chunk);
+    } else {
+      (payloads.get(pid) ?? payloads.set(pid, []).get(pid)!).push(...payload);
+    }
+  }
+
+  const pes = payloads.get(audioPid);
+  if (!pes || pes.length < 7) return null;
+
+  // extract ADTS frames from the PES payload stream
+  const frames: Uint8Array[] = [];
+  let i = 0;
+  while (i + 7 <= pes.length) {
+    if (pes[i] === 0xff && (pes[i + 1] & 0xf0) === 0xf0) {
+      const frameLen = ((pes[i + 3] & 0x03) << 11) | (pes[i + 4] << 3) | ((pes[i + 5] & 0xe0) >> 5);
+      if (frameLen >= 7 && i + frameLen <= pes.length) {
+        frames.push(Uint8Array.from(pes.slice(i, i + frameLen)));
+        i += frameLen;
+        continue;
+      }
+    }
+    i++;
+  }
+  return frames.length ? concatBytes(frames) : null;
 }
 
-function audioHeaders(meta: ReturnType<typeof trackMeta>, ext: string, mime: string, note: string | null, attachment: boolean, size: number | null): Headers {
+// ---------------------------------------------------------------- audio output
+
+function audioHeaders(meta: ReturnType<typeof trackMeta>, ext: string, mime: string, note: string | null, attachment: boolean, size: number): Headers {
   const h = corsHeaders();
   h.set("Content-Type", mime);
   const filename = sanitizeFilename(`${meta.artist} - ${meta.title}`) + "." + ext;
@@ -541,40 +689,138 @@ function audioHeaders(meta: ReturnType<typeof trackMeta>, ext: string, mime: str
   );
   h.set("X-SSDA-Extension", ext);
   if (note) h.set("X-SSDA-Format-Note", note.slice(0, 200));
-  if (size !== null) h.set("Content-Length", String(size));
+  h.set("Content-Length", String(size));
   return h;
+}
+
+interface Rendered {
+  bytes: Uint8Array;
+  ext: string;
+  mime: string;
+  container: string;
+  debug?: Record<string, unknown>;
+}
+
+/**
+ * Turn one candidate into playable bytes, validating the container. Throws
+ * ApiError('unsupported_container') when the rendition cannot be served as a
+ * playable file, and ApiError('drm_protected') for DRM-wrapped streams, so the
+ * caller can try the next candidate.
+ */
+async function renderCandidate(track: ScTrack, cand: Candidate): Promise<Rendered> {
+  const streamUrl = await getStreamUrl(cand.transcoding, track);
+  const proto = cand.transcoding.format?.protocol || "";
+  const direct = cand.transcoding.url.includes("/stream/progressive") ||
+    proto === "progressive" || proto === "download";
+
+  if (direct) {
+    const bytes = await fetchBytes(streamUrl, 2);
+    const container = containerOf(bytes);
+    const out = CONTAINER_OUT[container];
+    if (!out) {
+      throw new ApiError(415, "unsupported_container", `download stream is not playable audio (${container})`);
+    }
+    return { bytes, ext: out.ext, mime: out.mime, container };
+  }
+
+  const { bytes, container, debug } = await assembleHls(streamUrl);
+  if (container === "fmp4") {
+    return { bytes, ext: "m4a", mime: "audio/mp4", container, debug };
+  }
+  if (container === "ogg") {
+    return { bytes, ext: "opus", mime: "audio/ogg", container, debug };
+  }
+  if (container === "ts") {
+    const adts = tsToAdts(bytes);
+    if (adts) {
+      return { bytes: adts, ext: "aac", mime: "audio/aac", container, debug };
+    }
+  }
+  throw new ApiError(415, "unsupported_container", `rendition container '${container}' cannot be served as a playable file`);
 }
 
 async function serveAudio(url: string, fmt: string, attachment: boolean): Promise<Response> {
   const track = await resolveTrack(url);
   const meta = trackMeta(track, url);
-  const picked = pickTranscoding(track, fmt);
-  const streamUrl = await getStreamUrl(picked.transcoding);
-  const isProgressive = picked.transcoding.url.includes("/stream/progressive") ||
-    (picked.transcoding.format?.protocol || "") === "progressive";
+  const candidates = buildCandidates(track, fmt);
+  let lastErr: ApiError | null = null;
 
-  if (isProgressive) {
-    const res = await fetch(streamUrl, {
-      headers: { "User-Agent": UA },
-      signal: AbortSignal.timeout(30000),
-    });
-    if (!res.ok || !res.body) {
-      throw new ApiError(502, "upstream", `Audio fetch failed (HTTP ${res.status}).`);
+  for (const cand of candidates) {
+    try {
+      const out = await renderCandidate(track, cand);
+      const note = cand.download && fmt === "auto"
+        ? "original download file"
+        : fmt !== "auto" && out.ext !== fmt
+        ? `no ${fmt} rendition available; returning ${out.ext}`
+        : out.container === "ts"
+        ? "stream container converted to adts aac"
+        : null;
+      return new Response(out.bytes, {
+        status: 200,
+        headers: audioHeaders(meta, out.ext, out.mime, note, attachment, out.bytes.length),
+      });
+    } catch (err) {
+      if (err instanceof ApiError && (err.code === "unsupported_container" || err.code === "upstream" || err.code === "drm_protected")) {
+        lastErr = err;
+        continue; // try the next rendition
+      }
+      throw err;
     }
-    const len = res.headers.get("Content-Length");
-    return new Response(res.body, {
-      status: 200,
-      headers: audioHeaders(meta, picked.ext, picked.mime, picked.note, attachment, len ? Number(len) : null),
-    });
   }
 
-  // hls -> fetch init + all segments, concatenate (ogg pages / fMP4 fragments
-  // concatenate into a playable file)
-  const bytes = await downloadHls(streamUrl);
-  return new Response(bytes, {
-    status: 200,
-    headers: audioHeaders(meta, picked.ext, picked.mime, picked.note, attachment, bytes.length),
-  });
+  throw lastErr ??
+    new ApiError(403, "not_streamable", "No usable audio rendition found for this track.");
+}
+
+// ---------------------------------------------------------------- diagnostics
+
+/** GET /api/audio?...&debug=probe -> JSON diagnostics instead of audio bytes. */
+async function probeAudio(url: string, fmt: string): Promise<Response> {
+  const diag: Record<string, unknown> = { url, requested_format: fmt };
+  try {
+    const track = await resolveTrack(url);
+    diag.track_id = String(track.id);
+    diag.policy = track.policy ?? null;
+    diag.has_track_authorization = Boolean(track.track_authorization);
+    diag.downloadable = track.downloadable ?? null;
+    diag.has_downloads_left = track.has_downloads_left ?? null;
+    diag.transcodings = (track.media?.transcodings ?? []).map((t) => ({
+      url: t.url,
+      class: classifyTranscoding(t),
+      format: t.format,
+    }));
+    const candidates = buildCandidates(track, fmt);
+    const attempts: unknown[] = [];
+    let served: Record<string, unknown> | null = null;
+    for (const cand of candidates) {
+      const entry: Record<string, unknown> = {
+        class: cand.kind,
+        transcoding_url: cand.transcoding.url,
+        encrypted: cand.encrypted ?? false,
+        download: cand.download ?? false,
+      };
+      try {
+        const out = await renderCandidate(track, cand);
+        entry.container = out.container;
+        entry.ext = out.ext;
+        entry.size = out.bytes.length;
+        entry.first_bytes_hex = hexPreview(out.bytes);
+        entry.stream_url = await streamUrlOf(track, cand);
+        entry.debug = out.debug ?? null;
+        attempts.push(entry);
+        served = served ?? entry;
+      } catch (err) {
+        entry.error = err instanceof ApiError ? { code: err.code, message: err.message } : String((err as Error)?.message || err);
+        attempts.push(entry);
+      }
+    }
+    return jsonResponse({ ...diag, attempts, served });
+  } catch (err) {
+    diag.error = err instanceof ApiError
+      ? { code: err.code, message: err.message }
+      : String((err as Error)?.message || err);
+    return jsonResponse(diag);
+  }
 }
 
 // ---------------------------------------------------------------- router
@@ -611,6 +857,7 @@ export async function handleRequest(req: Request): Promise<Response> {
         if (url.searchParams.get("debug")) {
           return jsonResponse({
             ...meta,
+            policy: track.policy ?? null,
             transcodings: (track.media?.transcodings ?? []).map((t) => ({
               url: t.url,
               format: t.format,
@@ -632,6 +879,9 @@ export async function handleRequest(req: Request): Promise<Response> {
       const fmt = (url.searchParams.get("format") || "auto").toLowerCase();
       if (!FORMATS.includes(fmt)) {
         throw new ApiError(400, "invalid_format", `format must be one of: ${FORMATS.join(", ")}`);
+      }
+      if (url.searchParams.get("debug") === "probe") {
+        return await probeAudio(link, fmt);
       }
       return await serveAudio(link, fmt, path === "/api/download");
     }
