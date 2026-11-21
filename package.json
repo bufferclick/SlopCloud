@@ -1,0 +1,17 @@
+{
+  "name": "slopcloud",
+  "private": true,
+  "type": "module",
+  "description": "Test dependencies for the SSDA edge function (the function itself uses npm: imports; these mirror them for Node tests).",
+  "scripts": {
+    "test": "node tools/test-ssda.mjs"
+  },
+  "devDependencies": {
+    "@audio/decode-aac": "1.6.0",
+    "@audio/decode-mp3": "1.3.1",
+    "@mediabunny/aac-encoder": "1.66.2",
+    "@mediabunny/mp3-encoder": "1.66.2",
+    "mediabunny": "1.66.2",
+    "wasm-media-encoders": "0.7.0"
+  }
+}

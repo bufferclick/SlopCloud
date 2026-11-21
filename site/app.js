@@ -19,6 +19,8 @@
     format: $('format-select'),
     saveBtn: $('save-btn'),
     fileBtn: $('file-btn'),
+    importInput: $('import-input'),
+    importBtn: $('import-btn'),
     progressWrap: $('progress-wrap'),
     progressBar: $('progress-bar'),
     status: $('status'),
@@ -421,6 +423,26 @@
 
   els.fileBtn.addEventListener('click', function () {
     downloadToFiles();
+  });
+
+  els.importBtn.addEventListener('click', async function () {
+    var file = els.importInput.files && els.importInput.files[0];
+    if (!file) {
+      setStatus('Choose an audio file first.', 'error');
+      return;
+    }
+    busy(true);
+    setStatus('Saving file to cache…');
+    try {
+      var rec = await SlopCloud.importFile(file);
+      await reloadSongs();
+      setStatus('Saved to cache: ' + rec.title + '.' + rec.ext, 'ok');
+      els.importInput.value = '';
+    } catch (e) {
+      setStatus(e.message, 'error');
+    } finally {
+      busy(false);
+    }
   });
 
   els.clearBtn.addEventListener('click', async function () {
