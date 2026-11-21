@@ -174,6 +174,47 @@
       return record;
     },
 
+    /**
+     * Save an audio file from the user's device into the cache (for example a
+     * file downloaded elsewhere when SoundCloud blocks streaming). Stored and
+     * played exactly like songs fetched from a link.
+     */
+    importFile: async function (file, opts) {
+      opts = opts || {};
+      if (!file) throw new Error('No file selected.');
+      var name = (file.name || 'audio').replace(/\.[^.]+$/, '');
+      var ext = ((file.name.match(/\.([^.]+)$/) || [])[1] || '').toLowerCase();
+      var mime = file.type || '';
+      if (ext === 'mp3') mime = 'audio/mpeg';
+      else if (ext === 'm4a' || ext === 'mp4') { mime = 'audio/mp4'; ext = 'm4a'; }
+      else if (ext === 'aac') mime = 'audio/aac';
+      else if (ext === 'opus' || ext === 'ogg' || ext === 'oga') mime = 'audio/ogg';
+      else if (ext === 'wav') mime = 'audio/wav';
+      else if (ext === 'flac') mime = 'audio/flac';
+      if (!mime) mime = 'audio/mpeg';
+      if (!ext) ext = 'bin';
+      var id = 'file:' + hashId(name + ':' + file.size + ':' + (file.lastModified || 0));
+      var record = {
+        id: id,
+        title: name || 'Imported audio',
+        artist: opts.artist || 'Imported file',
+        duration: null,
+        artworkUrl: null,
+        sourceUrl: null,
+        ext: ext,
+        mime: mime.split(';')[0].trim(),
+        size: file.size,
+        savedAt: Date.now(),
+      };
+      var cache = await audioCache();
+      await cache.put(
+        new Request(cacheKey(id)),
+        new Response(file, { headers: { 'Content-Type': record.mime, 'X-SlopCloud-Title': encodeURIComponent(record.title) } })
+      );
+      await tx(await db(), 'readwrite', function (store) { store.put(record); });
+      return record;
+    },
+
     /** All stored songs, newest first. */
     listSongs: async function () {
       var songs = await tx(await db(), 'readonly', function (store) { return store.getAll(); });

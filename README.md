@@ -23,14 +23,18 @@ Repository layout:
 2. SSDA resolves the SoundCloud link server-side and passes the audio through
    **without re-encoding**, so quality is exactly what the uploader provided.
    `format=auto` prefers the progressive mp3 (smallest standard rendition,
-   plays everywhere), then m4a (AAC), then opus. Some tracks are only offered
-   as DRM-wrapped streams that cannot play outside a licensed player; for
-   those, when the artist allows downloads, the official download file is
-   served instead.
+   plays everywhere), then m4a (AAC), then opus. When you explicitly ask for
+   `format=mp3`, `m4a` or `opus` and the track has no file in that format, the
+   best available rendition is decoded and re-encoded to the format you asked
+   for. Some tracks are only offered as DRM-wrapped streams that cannot play
+   outside a licensed player; for those, when the artist allows downloads, the
+   official download file is served instead.
 3. The SlopCloud API in the browser stores the bytes in the site's own cache
    (Cache API) and the track info in IndexedDB. The song is now in the website,
    not in your downloads folder. Clear this site's stored data and the songs are
-   gone.
+   gone. Audio files you already have (for example downloaded elsewhere when
+   SoundCloud blocks a track) can be saved into the cache the same way with
+   "Save file to cache".
 4. "Download song to files" is the alternative: it saves the audio to your
    device the normal way.
 
@@ -52,11 +56,14 @@ GET /api/download?url=<link>                 audio bytes as a file download
 
 - `url` must be a SoundCloud link (`soundcloud.com`, `on.soundcloud.com`,
   `snd.sc`); short links are resolved. Playlists and profiles are rejected.
-- `format=auto` picks the progressive mp3 first, then m4a, then opus; an
-  explicit `format` prefers that rendition and falls back to the closest one.
+- `format=auto` picks the progressive mp3 first, then m4a, then opus, and is
+  never re-encoded. An explicit `format` prefers that rendition; when the
+  track has no file in the requested format, the best available rendition is
+  decoded and re-encoded to it (`X-SSDA-Format-Note: converted from ... to ...`).
 - Audio responses carry `X-SSDA-Extension` and a `Content-Disposition` filename
-  (`Artist - Title.ext`). When the requested format does not exist for a track,
-  the closest rendition is served and `X-SSDA-Format-Note` explains.
+  (`Artist - Title.ext`). When conversion is impossible (for example an
+  undecodable source), the closest rendition is served and
+  `X-SSDA-Format-Note` explains.
 - Renditions are container-validated before serving: HLS fMP4/Ogg are
   assembled as-is, MPEG-TS is demuxed to ADTS AAC, DRM-wrapped (cbcs/cenc)
   streams are skipped, and the artist's official download file is used when
@@ -81,13 +88,15 @@ python3 -m http.server 8000 --directory site
 ## Tests
 
 ```sh
+npm install          # mirrors the function's npm: imports for Node
 node tools/test-ssda.mjs
 ```
 
-43 tests covering routing, format selection, HLS assembly, container
-validation, DRM handling, the official-download fallback, error shapes, CORS,
-and resilience (challenge-page retries, flaky upstream, oEmbed fallback) — all
-against a mocked SoundCloud, no network needed.
+54 tests covering routing, format selection, format conversion (real
+decode/re-encode through wasm codecs), HLS assembly, container validation, DRM
+handling, the official-download fallback, error shapes, CORS, and resilience
+(challenge-page retries, flaky upstream, oEmbed fallback) — all against a
+mocked SoundCloud, no network needed.
 
 ## Notes
 

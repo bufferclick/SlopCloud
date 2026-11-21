@@ -3,7 +3,16 @@
 //
 //   node tools/test-ssda.mjs
 //
-import { handleRequest } from "../supabase/functions/ssda/index.ts";
+// Node loader hooks map the function's `npm:` imports (and .wasm asset
+// imports) onto the local node_modules install, so run `npm install` first.
+import { register } from "node:module";
+register("./npm-hook.mjs", import.meta.url);
+
+import { Conversion, Input, Output, BufferTarget, BufferSource, Mp3OutputFormat, Mp4OutputFormat, WaveInputFormat } from "mediabunny";
+import { registerMp3Encoder } from "@mediabunny/mp3-encoder";
+import { registerAacEncoder } from "@mediabunny/aac-encoder";
+
+const { handleRequest } = await import("../supabase/functions/ssda/index.ts");
 
 const CID = "CID1234567890abcdefghij";
 const BASE = "https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/ssda";
@@ -180,6 +189,68 @@ const oggOnlyFixture = {
   },
 };
 
+// ---- real audio fixtures for conversion tests (decoded + re-encoded) ----
+
+registerMp3Encoder();
+registerAacEncoder();
+
+function synthWav(sampleRate = 22050, freq = 440, secs = 0.35) {
+  const n = Math.round(sampleRate * secs);
+  const data = new Int16Array(n);
+  for (let i = 0; i < n; i++) data[i] = Math.round(Math.sin(2 * Math.PI * freq * i / sampleRate) * 12000);
+  const bytes = new Uint8Array(44 + data.byteLength);
+  const dv = new DataView(bytes.buffer);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) bytes[o + i] = s.charCodeAt(i); };
+  w(0, "RIFF"); dv.setUint32(4, 36 + data.byteLength, true); w(8, "WAVE");
+  w(12, "fmt "); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+  dv.setUint32(24, sampleRate, true); dv.setUint32(28, sampleRate * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+  w(36, "data"); dv.setUint32(40, data.byteLength, true);
+  bytes.set(new Uint8Array(data.buffer), 44);
+  return bytes;
+}
+
+async function wavToBytes(wav, format, codec, bitrate) {
+  const input = new Input({ source: new BufferSource(wav), formats: [new WaveInputFormat()] });
+  const target = new BufferTarget();
+  const output = new Output({ format, target });
+  const conversion = await Conversion.init({ input, output, audio: { codec, bitrate, forceTranscode: true } });
+  await conversion.execute();
+  return new Uint8Array(target.buffer);
+}
+
+const realMp3 = await wavToBytes(synthWav(), new Mp3OutputFormat(), "mp3", 128_000);
+const realM4a = await wavToBytes(synthWav(44100), new Mp4OutputFormat(), "aac", 96_000);
+
+// progressive renditions carrying the real bytes; format requests must
+// convert rather than serve the wrong container
+const convMp3Fixture = {
+  kind: "track",
+  id: 801,
+  title: "Conv MP3",
+  duration: 350,
+  permalink_url: "https://soundcloud.com/test/conv-mp3",
+  user: { username: "c" },
+  media: {
+    transcodings: [
+      { url: "https://api-v2.soundcloud.com/media/soundcloud:tracks:801/stream/progressive", format: { protocol: "progressive", mime_type: "audio/mpeg" }, quality: "sq" },
+    ],
+  },
+};
+
+const convAacFixture = {
+  kind: "track",
+  id: 802,
+  title: "Conv AAC",
+  duration: 350,
+  permalink_url: "https://soundcloud.com/test/conv-aac",
+  user: { username: "c" },
+  media: {
+    transcodings: [
+      { url: "https://api-v2.soundcloud.com/media/soundcloud:tracks:802/stream/progressive", format: { protocol: "progressive", mime_type: "audio/mp4" }, quality: "sq" },
+    ],
+  },
+};
+
 const opusMediaPlaylist = [
   "#EXTM3U",
   '#EXT-X-MAP:URI="init.ogg"',
@@ -284,6 +355,8 @@ globalThis.fetch = async (input) => {
     if (target.includes("restricted")) return J(restrictedFixture);
     if (target.includes("weird")) return J(weirdFixture);
     if (target.includes("ogg-only")) return J(oggOnlyFixture);
+    if (target.includes("conv-mp3")) return J(convMp3Fixture);
+    if (target.includes("conv-aac")) return J(convAacFixture);
     if (target.includes("download-track")) return J(downloadFixture);
     if (target.includes("drm-only")) return J(drmOnlyFixture);
     if (target.includes("wav-track")) return J(wavFixture);
@@ -313,6 +386,8 @@ globalThis.fetch = async (input) => {
   if (u.includes("/tracks/601/download")) return J({ url: "https://cf-media.sndcdn.com/x1.128.mp3" });
   if (u.includes("/tracks/603/download")) return J({ url: "https://cf-media.sndcdn.com/x3.wav" });
   if (u.includes("/tracks/604/download")) return J({ url: "https://cf-media.sndcdn.com/x4.128.mp3" });
+  if (u.includes("soundcloud:tracks:801") && u.includes("/stream/progressive")) return J({ url: "https://cf-media.sndcdn.com/conv/real.mp3" });
+  if (u.includes("soundcloud:tracks:802") && u.includes("/stream/progressive")) return J({ url: "https://cf-media.sndcdn.com/conv/real.m4a" });
   if (u.includes("/stream/progressive")) return J({ url: "https://cf-media.sndcdn.com/tkHfEWxK.mp3" });
   if (u.includes("/stream/hls/badaac")) return J({ url: "https://cf-hls-media.sndcdn.com/bad/playlist.m3u8" });
   if (u.includes("/stream/hls/ts")) return J({ url: "https://cf-hls-media.sndcdn.com/ts/playlist.m3u8" });
@@ -320,6 +395,12 @@ globalThis.fetch = async (input) => {
   if (u.includes("/stream/hls/aac")) return J({ url: "https://cf-hls-media.sndcdn.com/aac/master.m3u8?token=abc" });
   if (u.includes("/stream/hls")) return J({ url: "https://cf-hls-media.sndcdn.com/opus/playlist.m3u8?token=abc" });
   // audio bytes / playlists
+  if (u === "https://cf-media.sndcdn.com/conv/real.mp3") {
+    return R(realMp3, 200, { "Content-Type": "audio/mpeg" });
+  }
+  if (u === "https://cf-media.sndcdn.com/conv/real.m4a") {
+    return R(realM4a, 200, { "Content-Type": "audio/mp4" });
+  }
   if (u === "https://cf-media.sndcdn.com/tkHfEWxK.mp3" || u === "https://cf-media.sndcdn.com/auth.mp3") {
     return R(new Uint8Array([0x49, 0x44, 0x33, 1, 2, 3]), 200, { "Content-Type": "audio/mpeg", "Content-Length": "6" });
   }
@@ -434,10 +515,17 @@ async function call(path, init) {
   ok(weird.status === 200 && weird.headers.get("X-SSDA-Extension") === "mp3",
     "wrong mime still serves progressive mp3 first", weird.headers.get("X-SSDA-Extension"));
 
+  // a later rendition in the exact requested format wins over an earlier
+  // mismatched one
   const weirdOpus = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/weird") + "&format=opus");
-  ok(weirdOpus.status === 200 && weirdOpus.headers.get("X-SSDA-Extension") === "mp3" &&
-    String(weirdOpus.headers.get("X-SSDA-Format-Note")).includes("no opus rendition"),
-    "explicit format falls back with a note when only other renditions exist", String(weirdOpus.headers.get("X-SSDA-Format-Note")));
+  ok(weirdOpus.status === 200 && weirdOpus.headers.get("X-SSDA-Extension") === "opus",
+    "explicit format prefers an exact match over an earlier fallback candidate", String(weirdOpus.headers.get("X-SSDA-Extension")));
+
+  // when the source cannot be converted the old fallback note still applies
+  const oggToM4a = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/ogg-only") + "&format=m4a");
+  ok(oggToM4a.status === 200 && oggToM4a.headers.get("X-SSDA-Extension") === "opus" &&
+    String(oggToM4a.headers.get("X-SSDA-Format-Note")).includes("no m4a rendition"),
+    "explicit format falls back with a note when the source cannot be converted", String(oggToM4a.headers.get("X-SSDA-Format-Note")));
 
   const oggOnly = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/ogg-only") + "&format=auto");
   ok(oggOnly.status === 200 && oggOnly.headers.get("X-SSDA-Extension") === "opus",
@@ -536,6 +624,45 @@ async function call(path, init) {
   const fbAudio = await call2("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/test-track"));
   ok(fbAudio.status !== 200 && (await fbAudio.json()).error, "audio fails with a clear error when fully blocked");
   blockMode = false;
+}
+
+// 10. format conversion: decode + re-encode when no matching rendition exists
+{
+  console.log("conversion:");
+  const toMp3 = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/conv-aac") + "&format=mp3");
+  const toMp3Bytes = new Uint8Array(await toMp3.arrayBuffer());
+  ok(toMp3.status === 200 && toMp3.headers.get("X-SSDA-Extension") === "mp3" && toMp3.headers.get("Content-Type") === "audio/mpeg",
+    "format=mp3 converts aac -> mp3", String(toMp3.status) + " " + toMp3.headers.get("X-SSDA-Extension"));
+  ok(toMp3Bytes.length > 200 && (toMp3Bytes[0] === 0x49 || toMp3Bytes[0] === 0xff),
+    "converted mp3 has real frames", "len=" + toMp3Bytes.length + " head=" + toMp3Bytes[0]);
+  ok(String(toMp3.headers.get("X-SSDA-Format-Note")) === "converted from m4a to mp3",
+    "conversion note set", String(toMp3.headers.get("X-SSDA-Format-Note")));
+
+  const toOpus = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/conv-aac") + "&format=opus");
+  const toOpusBytes = new Uint8Array(await toOpus.arrayBuffer());
+  ok(toOpus.status === 200 && toOpus.headers.get("X-SSDA-Extension") === "opus",
+    "format=opus converts aac -> opus", String(toOpus.status));
+  ok(toOpusBytes.length > 100 && toOpusBytes[0] === 0x4f && toOpusBytes[1] === 0x67,
+    "converted opus is an Ogg stream", "len=" + toOpusBytes.length);
+
+  const toM4a = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/conv-mp3") + "&format=m4a");
+  const toM4aBytes = new Uint8Array(await toM4a.arrayBuffer());
+  ok(toM4a.status === 200 && toM4a.headers.get("X-SSDA-Extension") === "m4a",
+    "format=m4a converts mp3 -> m4a", String(toM4a.status));
+  ok(toM4aBytes.length > 200 && toM4aBytes[4] === 0x66 && toM4aBytes[5] === 0x74,
+    "converted m4a is an fMP4 file", "len=" + toM4aBytes.length);
+
+  // exact match stays a byte-identical passthrough ("quality is the same")
+  const passthru = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/conv-mp3") + "&format=mp3");
+  const passthruBytes = new Uint8Array(await passthru.arrayBuffer());
+  ok(passthruBytes.length === realMp3.length && passthruBytes.every((b, i) => b === realMp3[i]),
+    "mp3 -> mp3 passes the original bytes through untouched");
+  ok(passthru.headers.get("X-SSDA-Format-Note") === null, "passthrough carries no conversion note");
+
+  const drm3 = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/drm-only") + "&format=mp3");
+  const drm3Err = (await drm3.json()).error;
+  ok(drm3.status === 415 && drm3Err.code === "drm_protected" && /DRM/i.test(drm3Err.message),
+    "DRM-only + explicit format keeps the clear drm error", JSON.stringify(drm3Err));
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

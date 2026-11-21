@@ -38,6 +38,14 @@
       </div>
     </form>
 
+    <div class="file-import">
+      <p class="muted">Or save an audio file you already have into the cache:</p>
+      <div class="row">
+        <input id="import-input" type="file" accept="audio/*,.mp3,.m4a,.aac,.ogg,.opus,.wav,.flac">
+        <button type="button" id="import-btn" class="btn">Save file to cache</button>
+      </div>
+    </div>
+
     <div id="progress-wrap" class="progress-wrap hidden">
       <div id="progress-bar" class="progress-bar"></div>
     </div>
@@ -58,7 +66,8 @@
 
   <footer>
     <p>Audio is stored in this site's browser cache and plays from memory. Clearing this site's
-    stored data deletes the songs. Download only audio you are allowed to download.</p>
+    stored data deletes the songs. Choosing m4a, mp3 or opus converts the audio when SoundCloud
+    has no file in that format. Download only audio you are allowed to download.</p>
   </footer>
 </main>
 

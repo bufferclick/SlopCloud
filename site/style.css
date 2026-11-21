@@ -71,6 +71,9 @@ input[type="url"], select {
 .row input[type="url"] { flex: 1; min-width: 220px; }
 .row select { width: auto; }
 
+.file-import { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--line); }
+.file-import .row input[type="file"] { flex: 1; min-width: 220px; font: inherit; color: var(--muted); }
+
 .btn {
   padding: 10px 16px;
   border: 1px solid var(--line);

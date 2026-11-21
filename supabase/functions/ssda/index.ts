@@ -1,5 +1,5 @@
 // SSDA - SlopCloud Song Downloader API
-// Supabase Edge Function. Single file, no dependencies.
+// Supabase Edge Function. Single file.
 //
 //   GET /api/health                     status
 //   GET /api/info?url=<soundcloud-link>  track metadata (JSON)
@@ -14,9 +14,25 @@
 // skipped rather than served broken. DRM-wrapped renditions (cbcs/cenc) are
 // skipped when possible; when the artist allows downloads, the official
 // download file is served instead.
+//
+// When an explicit format is requested (mp3/m4a/opus) and SoundCloud has no
+// rendition in that format, the best available rendition is decoded and
+// re-encoded to the requested format (v2.6.0). Only the requested format
+// changes; format=auto is never transcoded.
+
+import { Conversion, Input, Output, BufferTarget, BufferSource, Mp3OutputFormat, Mp4OutputFormat, Mp4InputFormat, Mp3InputFormat, WaveInputFormat, OggInputFormat, AdtsInputFormat, FlacInputFormat } from "npm:mediabunny@1.66.2";
+import { registerMp3Encoder } from "npm:@mediabunny/mp3-encoder@1.66.2";
+import { registerAacEncoder } from "npm:@mediabunny/aac-encoder@1.66.2";
+import decodeAacFile from "npm:@audio/decode-aac@1.6.0";
+import decodeMp3File from "npm:@audio/decode-mp3@1.3.1";
+import { WasmMediaEncoder } from "npm:wasm-media-encoders@0.7.0";
+import oggWasm from "npm:wasm-media-encoders@0.7.0/wasm/ogg.wasm" with { type: "bytes" };
+
+registerMp3Encoder();
+registerAacEncoder();
 
 const SERVICE_NAME = "SSDA";
-const VERSION = "2.5.1";
+const VERSION = "2.6.0";
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
@@ -739,26 +755,192 @@ async function renderCandidate(track: ScTrack, cand: Candidate): Promise<Rendere
   throw new ApiError(415, "unsupported_container", `rendition container '${container}' cannot be served as a playable file`);
 }
 
+// ---------------------------------------------------------------- conversion
+// When an explicit format is requested and no rendition exists in that format,
+// decode the best available rendition and re-encode it to the requested format.
+// Only used for explicit format requests; format=auto is never transcoded.
+
+type Pcm = { channelData: Float32Array[]; sampleRate: number };
+
+function pcmToWav(pcm: Pcm): Uint8Array {
+  const { channelData, sampleRate } = pcm;
+  const n = channelData[0].length;
+  const ch = channelData.length;
+  const data = new Int16Array(n * ch);
+  for (let i = 0; i < n; i++) {
+    for (let c = 0; c < ch; c++) {
+      const v = Math.max(-1, Math.min(1, channelData[c][i]));
+      data[i * ch + c] = Math.round(v * 32767);
+    }
+  }
+  const bytes = new Uint8Array(44 + data.byteLength);
+  const dv = new DataView(bytes.buffer);
+  const w = (o: number, s: string) => {
+    for (let i = 0; i < s.length; i++) bytes[o + i] = s.charCodeAt(i);
+  };
+  w(0, "RIFF");
+  dv.setUint32(4, 36 + data.byteLength, true);
+  w(8, "WAVE");
+  w(12, "fmt ");
+  dv.setUint32(16, 16, true);
+  dv.setUint16(20, 1, true);
+  dv.setUint16(22, ch, true);
+  dv.setUint32(24, sampleRate, true);
+  dv.setUint32(28, sampleRate * 2 * ch, true);
+  dv.setUint16(32, 2 * ch, true);
+  dv.setUint16(34, 16, true);
+  w(36, "data");
+  dv.setUint32(40, data.byteLength, true);
+  bytes.set(new Uint8Array(data.buffer), 44);
+  return bytes;
+}
+
+function wavToPcm(bytes: Uint8Array): Pcm {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (dv.getUint32(0, false) !== 0x52494646) {
+    throw new ApiError(415, "unsupported_container", "not a wav file");
+  }
+  let pos = 12;
+  let sampleRate = 44100;
+  let channels = 1;
+  let bits = 16;
+  let dataPos = -1;
+  let dataLen = 0;
+  while (pos + 8 <= bytes.length) {
+    const id = dv.getUint32(pos, false);
+    const size = dv.getUint32(pos + 4, true);
+    if (id === 0x666d7420) { // "fmt "
+      channels = dv.getUint16(pos + 10, true);
+      sampleRate = dv.getUint32(pos + 12, true);
+      bits = dv.getUint16(pos + 22, true);
+    } else if (id === 0x64617461) { // "data"
+      dataPos = pos + 8;
+      dataLen = Math.min(size, bytes.length - dataPos);
+    }
+    pos += 8 + size + (size % 2);
+  }
+  if (dataPos < 0 || bits !== 16) {
+    throw new ApiError(415, "unsupported_container", `unsupported wav layout (bits=${bits})`);
+  }
+  const samples = Math.floor(dataLen / (2 * channels));
+  const channelData: Float32Array[] = [];
+  for (let c = 0; c < channels; c++) channelData.push(new Float32Array(samples));
+  for (let i = 0; i < samples; i++) {
+    for (let c = 0; c < channels; c++) {
+      channelData[c][i] = dv.getInt16(dataPos + (i * channels + c) * 2, true) / 32768;
+    }
+  }
+  return { channelData, sampleRate };
+}
+
+async function decodeToPcm(bytes: Uint8Array, ext: string): Promise<Pcm> {
+  if (ext === "mp3") return await decodeMp3File(bytes);
+  if (ext === "m4a" || ext === "aac") return await decodeAacFile(bytes);
+  if (ext === "wav") return wavToPcm(bytes);
+  throw new ApiError(415, "unsupported_container", `cannot convert audio from '${ext}'`);
+}
+
+function resample(ch: Float32Array, from: number, to: number): Float32Array {
+  if (from === to) return ch;
+  const n = Math.round(ch.length * to / from);
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const srcPos = i * from / to;
+    const i0 = Math.floor(srcPos);
+    const i1 = Math.min(i0 + 1, ch.length - 1);
+    const frac = srcPos - i0;
+    out[i] = ch[i0] * (1 - frac) + ch[i1] * frac;
+  }
+  return out;
+}
+
+async function encodeOpus(pcm: Pcm): Promise<Uint8Array> {
+  const OPUS_RATES = [8000, 12000, 16000, 24000, 48000];
+  const rate = OPUS_RATES.includes(pcm.sampleRate) ? pcm.sampleRate : 48000;
+  const channels = pcm.channelData.length >= 2 ? 2 : 1;
+  const chs = pcm.channelData.slice(0, channels).map((c) => resample(c, pcm.sampleRate, rate));
+  const enc = await WasmMediaEncoder.create("audio/ogg", oggWasm as unknown as Uint8Array);
+  enc.configure({ channels: channels as 1 | 2, sampleRate: rate, vbrQuality: 8 });
+  const parts: Uint8Array[] = [];
+  const frame = Math.round(rate * 0.02); // 20 ms frames
+  for (let off = 0; off < chs[0].length; off += frame) {
+    const chunk = chs.map((c) => c.subarray(off, Math.min(off + frame, c.length)));
+    if (chunk[0].length === 0) break;
+    const b = enc.encode(chunk);
+    if (b.length) parts.push(b);
+  }
+  const fin = enc.finalize();
+  if (fin.length) parts.push(fin);
+  const total = parts.reduce((a, b) => a + b.length, 0);
+  const bytes = new Uint8Array(total);
+  let o = 0;
+  for (const p of parts) {
+    bytes.set(p, o);
+    o += p.length;
+  }
+  return bytes;
+}
+
+async function convertAudio(bytes: Uint8Array, srcExt: string, fmt: string): Promise<Rendered> {
+  const pcm = await decodeToPcm(bytes, srcExt);
+  if (!pcm.channelData.length || !pcm.channelData[0]?.length) {
+    throw new ApiError(415, "unsupported_container", "decoded audio is empty");
+  }
+  if (fmt === "opus") {
+    const ogg = await encodeOpus(pcm);
+    return { bytes: ogg, ext: "opus", mime: "audio/ogg", container: "ogg" };
+  }
+  const wav = pcmToWav(pcm);
+  const input = new Input({
+    source: new BufferSource(wav),
+    formats: [new WaveInputFormat()],
+  });
+  const target = new BufferTarget();
+  const output = new Output({
+    format: fmt === "mp3" ? new Mp3OutputFormat() : new Mp4OutputFormat(),
+    target,
+  });
+  const conversion = await Conversion.init({
+    input,
+    output,
+    audio: {
+      codec: fmt === "mp3" ? "mp3" : "aac",
+      bitrate: fmt === "mp3" ? 320_000 : 256_000,
+      forceTranscode: true,
+    },
+  });
+  await conversion.execute();
+  return {
+    bytes: new Uint8Array(target.buffer as ArrayBuffer),
+    ext: fmt === "mp3" ? "mp3" : "m4a",
+    mime: fmt === "mp3" ? "audio/mpeg" : "audio/mp4",
+    container: fmt === "mp3" ? "mp3" : "fmp4",
+  };
+}
+
 async function serveAudio(url: string, fmt: string, attachment: boolean): Promise<Response> {
   const track = await resolveTrack(url);
   const meta = trackMeta(track, url);
   const candidates = buildCandidates(track, fmt);
   let lastErr: ApiError | null = null;
+  let source: Rendered | null = null;
 
   for (const cand of candidates) {
     try {
       const out = await renderCandidate(track, cand);
-      const note = cand.download && fmt === "auto"
-        ? "original download file"
-        : fmt !== "auto" && out.ext !== fmt
-        ? `no ${fmt} rendition available; returning ${out.ext}`
-        : out.container === "ts"
-        ? "stream container converted to adts aac"
-        : null;
-      return new Response(out.bytes, {
-        status: 200,
-        headers: audioHeaders(meta, out.ext, out.mime, note, attachment, out.bytes.length),
-      });
+      // Remember the first (highest-preference) rendition as conversion source.
+      source ??= out;
+      if (fmt === "auto" || out.ext === fmt) {
+        const note = cand.download && fmt === "auto"
+          ? "original download file"
+          : out.container === "ts"
+          ? "stream container converted to adts aac"
+          : null;
+        return new Response(out.bytes, {
+          status: 200,
+          headers: audioHeaders(meta, out.ext, out.mime, note, attachment, out.bytes.length),
+        });
+      }
     } catch (err) {
       if (err instanceof ApiError && (err.code === "unsupported_container" || err.code === "upstream" || err.code === "drm_protected")) {
         lastErr = err;
@@ -768,6 +950,31 @@ async function serveAudio(url: string, fmt: string, attachment: boolean): Promis
     }
   }
 
+  // No rendition in the requested format: convert the best one we could render.
+  if (fmt !== "auto" && source) {
+    try {
+      const out = await convertAudio(source.bytes, source.ext, fmt);
+      return new Response(out.bytes, {
+        status: 200,
+        headers: audioHeaders(meta, out.ext, out.mime, `converted from ${source.ext} to ${out.ext}`, attachment, out.bytes.length),
+      });
+    } catch {
+      // Conversion unsupported for this source: serve the rendition as-is.
+      const note = `no ${fmt} rendition available; returning ${source.ext}`;
+      return new Response(source.bytes, {
+        status: 200,
+        headers: audioHeaders(meta, source.ext, source.mime, note, attachment, source.bytes.length),
+      });
+    }
+  }
+
+  if (lastErr?.code === "drm_protected") {
+    throw new ApiError(
+      415,
+      "drm_protected",
+      "SoundCloud serves only DRM-encrypted audio for this track and offers no download file. SlopCloud will not serve encrypted bytes; if you have the audio file, the site can save it to the cache.",
+    );
+  }
   throw lastErr ??
     new ApiError(403, "not_streamable", "No usable audio rendition found for this track.");
 }
