@@ -2,7 +2,7 @@
  * SlopCloud API - browser-side song storage.
  *
  * Songs are kept in the site's own storage:
- *   - audio bytes  -> Cache API   (caches 'slopcloud-v1-audio')
+ *   - audio bytes  -> Cache API   (caches 'slopcloud-v2-audio')
  *   - metadata     -> IndexedDB   (db 'slopcloud', store 'songs')
  * Nothing is written to the device's downloads folder. Clearing this site's
  * stored data (or pressing delete/clear in the UI) removes the songs.
@@ -16,9 +16,10 @@
 (function () {
   'use strict';
 
-  var AUDIO_CACHE = 'slopcloud-v1-audio';
+  var AUDIO_CACHE = 'slopcloud-v2-audio';
+  var LEGACY_AUDIO_CACHES = ['slopcloud-v1-audio'];
   var DB_NAME = 'slopcloud';
-  var DB_VERSION = 1;
+  var DB_VERSION = 2;
   var STORE = 'songs';
 
   function cacheKey(id) {
@@ -44,9 +45,12 @@
       var req = indexedDB.open(DB_NAME, DB_VERSION);
       req.onupgradeneeded = function () {
         var db = req.result;
-        if (!db.objectStoreNames.contains(STORE)) {
-          db.createObjectStore(STORE, { keyPath: 'id' });
+        // v2: start from a clean slate - old entries were saved by earlier
+        // builds and some contain audio that does not play
+        if (db.objectStoreNames.contains(STORE)) {
+          db.deleteObjectStore(STORE);
         }
+        db.createObjectStore(STORE, { keyPath: 'id' });
       };
       req.onsuccess = function () { resolve(req.result); };
       req.onerror = function () { reject(req.error || new Error('Could not open the SlopCloud database.')); };
@@ -86,6 +90,12 @@
     init: async function () {
       await db();
       await audioCache();
+      // drop legacy audio caches from earlier versions
+      if ('caches' in self) {
+        for (var i = 0; i < LEGACY_AUDIO_CACHES.length; i++) {
+          try { await caches.delete(LEGACY_AUDIO_CACHES[i]); } catch (e) { /* ignore */ }
+        }
+      }
       return SlopCloud;
     },
 

@@ -47,6 +47,30 @@
   var audio = new Audio();
   audio.addEventListener('timeupdate', onTimeUpdate);
   audio.addEventListener('loadedmetadata', onTimeUpdate);
+  var playFallbackTried = {};
+  audio.addEventListener('error', function () {
+    // Cached audio failed to play (e.g. an early build saved a rendition the
+    // browser cannot decode): refetch this song as mp3 once, then replay.
+    var id = state.playingId;
+    if (!id) return;
+    if (playFallbackTried[id]) {
+      setStatus('Could not play this song (the audio is not playable).', 'error');
+      stopPlayback();
+      return;
+    }
+    playFallbackTried[id] = true;
+    var song = state.songs.filter(function (s) { return s.id === id; })[0];
+    if (!song) { stopPlayback(); return; }
+    setStatus('Playback failed – refetching this song as mp3…');
+    releaseUrl();
+    SlopCloud.fetchAndCache(API_BASE, song.sourceUrl, { format: 'mp3' })
+      .then(function () { return reloadSongs(); })
+      .then(function () { return playSong(id); })
+      .catch(function (e) {
+        setStatus('Could not play this song: ' + e.message, 'error');
+        stopPlayback();
+      });
+  });
   audio.addEventListener('ended', function () {
     updatePlayButtons();
     els.playerToggle.textContent = '▶';
