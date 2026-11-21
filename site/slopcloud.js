@@ -1,5 +1,5 @@
 /*
- * SlopCloud API - browser-side song storage.
+ * SlopCloud API - browser-side song storage. Standalone, no dependencies.
  *
  * Songs are kept in the site's own storage:
  *   - audio bytes  -> Cache API   (caches 'slopcloud-v2-audio')
@@ -7,11 +7,22 @@
  * Nothing is written to the device's downloads folder. Clearing this site's
  * stored data (or pressing delete/clear in the UI) removes the songs.
  *
- * Usage:
- *   await SlopCloud.init();
- *   await SlopCloud.fetchAndCache(apiBase, soundcloudUrl, { format, onProgress });
- *   const songs = await SlopCloud.listSongs();
- *   const blob  = await SlopCloud.getSongBlob(songs[0].id);
+ * Public API (all async unless noted):
+ *   init()                                  open storage; returns SlopCloud
+ *   fetchAndCache(apiBase, url, opts)       download a SoundCloud link into the
+ *                                           cache; opts = { format='auto',
+ *                                           onProgress(loaded,total),
+ *                                           skipIfCached=false }; returns the
+ *                                           song record { id, title, artist,
+ *                                           ext, size, note, snip, ... }
+ *   importFile(file)                        store a local audio File in the cache
+ *   listSongs()                             array of song records, newest first
+ *   getSong(id)                             one record, or null
+ *   getSongBlob(id)                         the audio Blob
+ *   createObjectURL(id) / releaseObjectURL(url)   playback URLs
+ *   deleteSong(id) / clearAll()             remove one / all
+ *   usage()                                 { used, quota, songs }
+ *   saveFile(blob, filename)                trigger a browser download (not async)
  */
 (function () {
   'use strict';
@@ -288,6 +299,19 @@
         } catch (e) { /* keep song-sum estimate */ }
       }
       return { used: used, quota: quota, songs: songs.length };
+    },
+
+    /** Trigger a browser download of a Blob. */
+    saveFile: function (blob, filename) {
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function () {
+        URL.revokeObjectURL(a.href);
+        a.remove();
+      }, 4000);
     },
   };
 
