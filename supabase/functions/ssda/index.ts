@@ -237,7 +237,7 @@ function loadOpusEncoder() {
 }
 
 const SERVICE_NAME = "SSDA";
-const VERSION = "2.8.1";
+const VERSION = "2.9.0";
 // SoundCloud's anti-abuse hard-404s requests that impersonate desktop
 // browsers from datacenter IPs; a plain self-identifying UA passes. Keep a
 // browser-like UA only for fetching SoundCloud's own HTML/JS bundles.
@@ -262,6 +262,9 @@ const FORMATS = ["auto", "m4a", "mp3", "opus"];
 // GET ...&format=mp3&chunk=info  -> how many chunks (JSON)
 // GET ...&format=mp3&chunk=N     -> chunk N (valid partial mp3/opus; append
 //                                   them in order to get the full file)
+// GET ...&format=mp3&chunk=all   -> the whole file in one response, assembled
+//                                   from the server-side chunk cache (409 with
+//                                   a missing[] list until the chunks exist)
 // Single-request conversion stays available for tracks up to
 // SINGLE_CONVERT_MAX_MS; format=auto is passthrough and never chunked.
 const SINGLE_CONVERT_MAX_MS = 25000;
@@ -270,10 +273,22 @@ const CHUNK_SECONDS = 10;
 class ApiError extends Error {
   status: number;
   code: string;
-  constructor(status: number, code: string, message: string) {
+  /** Honored Retry-After hint in seconds, echoed to clients on 429/502. */
+  retryAfter?: number;
+  /** Extra machine-readable fields merged into the error JSON (e.g. missing[]). */
+  details?: Record<string, unknown>;
+  constructor(
+    status: number,
+    code: string,
+    message: string,
+    retryAfter?: number,
+    details?: Record<string, unknown>,
+  ) {
     super(message);
     this.status = status;
     this.code = code;
+    this.retryAfter = retryAfter;
+    this.details = details;
   }
 }
 
@@ -286,7 +301,8 @@ function corsHeaders(): Headers {
   h.set("Access-Control-Allow-Headers", "Range, Content-Type");
   h.set(
     "Access-Control-Expose-Headers",
-    "Content-Length, Content-Disposition, X-SSDA-Extension, X-SSDA-Format-Note",
+    "Content-Length, Content-Disposition, X-SSDA-Extension, X-SSDA-Format-Note, " +
+    "X-SSDA-Chunk-Index, X-SSDA-Chunk-Count, X-SSDA-Cache, Retry-After",
   );
   return h;
 }
@@ -298,7 +314,14 @@ function jsonResponse(data: unknown, status = 200): Response {
 }
 
 function errorResponse(err: ApiError): Response {
-  return jsonResponse({ error: { code: err.code, message: err.message } }, err.status);
+  const body: Record<string, unknown> = { code: err.code, message: err.message };
+  if (err.retryAfter && err.retryAfter > 0) body.retry_after_seconds = Math.ceil(err.retryAfter);
+  if (err.details) Object.assign(body, err.details);
+  const res = jsonResponse({ error: body }, err.status);
+  if (err.retryAfter && err.retryAfter > 0) {
+    res.headers.set("Retry-After", String(Math.ceil(err.retryAfter)));
+  }
+  return res;
 }
 
 function serviceIndex() {
@@ -310,7 +333,7 @@ function serviceIndex() {
     endpoints: {
       "/api/health": "GET - status",
       "/api/info": "GET - ?url=<soundcloud-link> track metadata",
-      "/api/audio": "GET - ?url=<soundcloud-link>&format=auto|m4a|mp3|opus audio bytes",
+      "/api/audio": "GET - ?url=<soundcloud-link>&format=auto|m4a|mp3|opus audio bytes (add &chunk=info|N|all for long-track chunked conversion)",
       "/api/download": "GET - same as /api/audio but saved as a file",
     },
   };
@@ -437,6 +460,168 @@ const CONTAINER_OUT: Record<string, { ext: string; mime: string }> = {
 
 // ---------------------------------------------------------------- client_id
 
+// ---------------------------------------------------------- response cache
+// Server-side cache (Postgres table ssda_cache via PostgREST) so repeat
+// requests never hit SoundCloud twice: converted chunks, whole files, and tiny
+// JSON meta rows (chunk counts, response headers). This is how the big
+// downloader sites feel instant: convert once, serve from storage after that.
+// Disabled (pure pass-through) when SUPABASE_URL / SERVICE_ROLE_KEY are absent
+// - e.g. local tests unless a test opts in.
+const CACHE_VER = "c1";
+
+function envOf(name: string): string | undefined {
+  try {
+    const d = (globalThis as { Deno?: { env?: { get?: (n: string) => string | undefined } } }).Deno;
+    const v = d?.env?.get?.(name);
+    if (v) return v;
+  } catch { /* not Deno */ }
+  try {
+    const p = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process;
+    return p?.env?.[name];
+  } catch { /* no process */ }
+  return undefined;
+}
+
+function cacheBase(): { url: string; key: string } | null {
+  const url = envOf("SUPABASE_URL");
+  const key = envOf("SUPABASE_SERVICE_ROLE_KEY");
+  return url && key ? { url: url.replace(/\/$/, ""), key } : null;
+}
+
+function b64encode(bytes: Uint8Array): string {
+  let s = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(s);
+}
+
+function b64decode(s: string): Uint8Array {
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+/** Accept bytea as base64 (aeson default) or as PostgreSQL hex ('\x...'). */
+function decodeCacheBlob(s: string): Uint8Array {
+  if (s.startsWith("\\x") || s.startsWith("0x")) {
+    const hex = s.slice(2);
+    const out = new Uint8Array(hex.length >> 1);
+    for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    return out;
+  }
+  return b64decode(s);
+}
+
+function chunkMetaKey(trackId: string | number, fmt: string): string {
+  return `${CACHE_VER}:cm:${trackId}:${fmt}`;
+}
+function chunkKey(trackId: string | number, fmt: string, idx: number): string {
+  return `${CACHE_VER}:ck:${trackId}:${fmt}:${idx}`;
+}
+function fullMetaKey(trackId: string | number, fmt: string): string {
+  return `${CACHE_VER}:fm:${trackId}:${fmt}`;
+}
+function fullKey(trackId: string | number, fmt: string): string {
+  return `${CACHE_VER}:f:${trackId}:${fmt}`;
+}
+
+function metaJsonBytes(obj: unknown): Uint8Array {
+  return new TextEncoder().encode(JSON.stringify(obj));
+}
+
+function parseMetaJson(raw: Uint8Array | undefined): Record<string, unknown> | null {
+  if (!raw) return null;
+  try {
+    const v = JSON.parse(new TextDecoder().decode(raw));
+    return v && typeof v === "object" ? v as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+async function cacheGetMany(keys: string[]): Promise<Map<string, Uint8Array>> {
+  const base = cacheBase();
+  const out = new Map<string, Uint8Array>();
+  if (!base || keys.length === 0) return out;
+  try {
+    // One eq. lookup per key. Keys are URL-safe by construction (letters,
+    // digits, ':', '-'), so the value is sent raw: PostgREST filter parsing is
+    // unreliable with percent-encoded values in some deployments.
+    const results = await Promise.all(keys.map(async (key) => {
+      try {
+        const res = await fetch(
+          `${base.url}/rest/v1/ssda_cache?select=cache_key,data&cache_key=eq.${key}`,
+          {
+            headers: { apikey: base.key, Authorization: `Bearer ${base.key}` },
+            signal: AbortSignal.timeout(10000),
+          },
+        );
+        if (!res.ok) {
+          cacheNoteError("cache-get", `HTTP ${res.status}`);
+          return null;
+        }
+        const rows = await res.json();
+        const row = Array.isArray(rows) ? rows[0] : null;
+        return row && typeof row.data === "string" ? [key, decodeCacheBlob(row.data)] as const : null;
+      } catch (err) {
+        cacheNoteError("cache-get", err instanceof Error ? err.message : String(err));
+        return null;
+      }
+    }));
+    for (const r of results) {
+      if (r) out.set(r[0], r[1]);
+    }
+  } catch {
+    // cache trouble must never break serving
+  }
+  return out;
+}
+
+let cacheSets = 0;
+let cacheLastError: string | null = null;
+function cacheNoteError(where: string, detail: string): void {
+  cacheLastError = `${where}: ${detail}`.slice(0, 120);
+}
+async function cacheSet(key: string, data: Uint8Array): Promise<void> {
+  const base = cacheBase();
+  if (!base) return;
+  try {
+    // bytea travels through PostgREST as a text value; the '\\x' hex input
+    // form makes Postgres store the RAW bytes (a base64 string would land as
+    // its literal text via the escape-format cast - reads then see garbage).
+    let hex = "";
+    for (let i = 0; i < data.length; i++) hex += data[i].toString(16).padStart(2, "0");
+    await fetch(`${base.url}/rest/v1/ssda_cache`, {
+      method: "POST",
+      headers: {
+        apikey: base.key,
+        Authorization: `Bearer ${base.key}`,
+        "Content-Type": "application/json",
+        Prefer: "resolution=merge-duplicates,return=minimal",
+      },
+      body: JSON.stringify([{ cache_key: key, data: "\\x" + hex, bytes: data.length }]),
+      signal: AbortSignal.timeout(15000),
+    });
+    // best-effort eviction of week-old rows, occasionally
+    if (++cacheSets % 20 === 1) {
+      const cutoff = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+      await fetch(`${base.url}/rest/v1/ssda_cache?created_at=lt.${cutoff}`, {
+        method: "DELETE",
+        headers: { apikey: base.key, Authorization: `Bearer ${base.key}` },
+        signal: AbortSignal.timeout(8000),
+      });
+    }
+  } catch {
+    // cache trouble must never break serving
+  }
+}
+
+function fmtExtMime(fmt: string): { ext: string; mime: string } {
+  return fmt === "opus" ? { ext: "opus", mime: "audio/ogg" } : { ext: "mp3", mime: "audio/mpeg" };
+}
+
 let clientIdCache: { id: string; at: number } | null = null;
 const CLIENT_ID_TTL = 30 * 60 * 1000;
 
@@ -453,16 +638,18 @@ const ENTRY_PAGES = [
   "https://m.soundcloud.com/",
 ];
 
-function findClientId(text: string): string | null {
+function findAllClientIds(text: string): string[] {
+  const out: string[] = [];
   for (const re of CLIENT_ID_PATTERNS) {
-    const m = text.match(re);
-    if (m) return m[1];
+    for (const m of text.matchAll(new RegExp(re.source, "g"))) {
+      if (m[1] && !out.includes(m[1])) out.push(m[1]);
+    }
   }
-  return null;
+  return out;
 }
 
-/** Fetch one page and look for the client_id inline and in its JS bundles. */
-async function scanPageForClientId(page: string): Promise<string | null> {
+/** Fetch one page and collect the client_ids inline and in its JS bundles. */
+async function scanPageForClientIds(page: string, want = 8): Promise<string[]> {
   const res = await fetch(page, {
     headers: {
       "User-Agent": PAGE_UA,
@@ -471,22 +658,21 @@ async function scanPageForClientId(page: string): Promise<string | null> {
     },
     signal: AbortSignal.timeout(15000),
   });
-  if (!res.ok) return null;
+  if (!res.ok) return [];
   const html = await res.text();
-
-  const inline = findClientId(html);
-  if (inline) return inline;
+  const found = findAllClientIds(html);
+  if (found.length >= want) return found.slice(0, want);
 
   const assets = [...new Set(
     [...html.matchAll(/(?:https?:)?\/\/(?:[a-z0-9-]+\.)?sndcdn\.com\/assets\/[A-Za-z0-9._-]+\.js/g)]
       .map((m) => (m[0].startsWith("//") ? "https:" + m[0] : m[0])),
   )];
-  if (assets.length === 0) return null;
+  if (assets.length === 0) return found;
   assets.reverse(); // newest bundles first
 
   const queue = [...assets];
   let scanned = 0;
-  while (queue.length > 0 && scanned < 20) {
+  while (queue.length > 0 && scanned < 20 && found.length < want) {
     const batch = queue.splice(0, 5);
     scanned += batch.length;
     const results = await Promise.allSettled(
@@ -500,25 +686,39 @@ async function scanPageForClientId(page: string): Promise<string | null> {
     );
     for (const r of results) {
       if (r.status !== "fulfilled") continue;
-      const cid = findClientId(r.value);
-      if (cid) return cid;
+      for (const cid of findAllClientIds(r.value)) {
+        if (!found.includes(cid)) found.push(cid);
+        if (found.length >= want) break;
+      }
     }
   }
-  return null;
+  return found;
 }
+
+// Pool of working client_ids: one scrape fills several, so a poisoned id is
+// survived by rotating to the next instead of scraping under pressure (the
+// scrape itself is what bot-challenges).
+let clientIdPool: { ids: string[]; next: number; at: number } | null = null;
 
 async function getClientId(): Promise<string> {
   if (clientIdCache && Date.now() - clientIdCache.at < CLIENT_ID_TTL) return clientIdCache.id;
+
+  const poolFresh = clientIdPool !== null && Date.now() - clientIdPool.at < CLIENT_ID_TTL;
+  if (poolFresh && clientIdPool!.next < clientIdPool!.ids.length) {
+    clientIdCache = { id: clientIdPool!.ids[clientIdPool!.next++], at: Date.now() };
+    return clientIdCache.id;
+  }
 
   // SoundCloud intermittently serves bot-challenge pages (no asset bundles),
   // especially under concurrent requests: rotate entry pages with retries.
   for (const page of ENTRY_PAGES) {
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const cid = await scanPageForClientId(page);
-        if (cid) {
-          clientIdCache = { id: cid, at: Date.now() };
-          return cid;
+        const ids = await scanPageForClientIds(page);
+        if (ids.length > 0) {
+          clientIdPool = { ids, next: 1, at: Date.now() };
+          clientIdCache = { id: ids[0], at: Date.now() };
+          return clientIdCache.id;
         }
       } catch {
         // try the next page / attempt
@@ -530,6 +730,7 @@ async function getClientId(): Promise<string> {
     502,
     "upstream",
     "Could not obtain a SoundCloud client_id (SoundCloud served a blocked or changed page). Try again in a few seconds.",
+    15,
   );
 }
 
@@ -631,7 +832,13 @@ async function resolveTrack(inputUrl: string): Promise<ScTrack> {
       throw new ApiError(404, "track_not_found", "No SoundCloud track found at this link.");
     }
     if (res.status === 429) {
-      throw new ApiError(429, "rate_limited", "SoundCloud is rate-limiting requests. Try again shortly.");
+      const ra = Number(res.headers.get("retry-after"));
+      throw new ApiError(
+        429,
+        "rate_limited",
+        "SoundCloud is rate-limiting requests. Try again shortly.",
+        Number.isFinite(ra) && ra > 0 ? ra : 30,
+      );
     }
     if (!res.ok) continue;
 
@@ -754,10 +961,20 @@ function legacyStreamCandidate(track: ScTrack): Candidate {
   };
 }
 
-/** DRM-wrapped renditions (cbcs/cenc) never play outside a licensed player. */
+/**
+ * DRM-wrapped renditions (Widevine/FairPlay: cbc-/ctr-encrypted-hls, cbcs/cenc
+ * URLs) never play outside a licensed player. Plain `encrypted-hls` is NOT
+ * DRM: it is ordinary HLS AES-128 whose key URI is served to any client that
+ * can read the playlist (hls.js and ffmpeg decrypt it transparently), so the
+ * pipeline handles it like any HLS rendition.
+ */
 function isEncrypted(t: Transcoding): boolean {
   const proto = (t.format?.protocol || "").toLowerCase();
-  return proto.includes("encrypted") || (t.url || "").includes("/cbcs/") || (t.url || "").includes("/cenc/");
+  const u = t.url || "";
+  if (proto.startsWith("ctr-") || proto.startsWith("cbc-")) return true;
+  if (u.includes("/cbcs/") || u.includes("/cenc/")) return true;
+  if (proto === "encrypted-hls" || proto === "hls-aes") return false;
+  return proto.includes("encrypted");
 }
 
 /** The official download button's file (original upload), when the artist allows it. */
@@ -829,6 +1046,7 @@ function buildCandidates(track: ScTrack, fmt: string): Candidate[] {
 
 async function getStreamUrl(transcoding: Transcoding, track?: ScTrack): Promise<string> {
   let lastStatus = 0;
+  let lastRetryAfter: number | undefined;
   let ta = track?.track_authorization ?? null;
   for (let attempt = 0; attempt < 5; attempt++) {
     if (attempt > 0) {
@@ -851,6 +1069,12 @@ async function getStreamUrl(transcoding: Transcoding, track?: ScTrack): Promise<
       if (res.ok) {
         const data = await res.json();
         if (data?.url) return data.url;
+      } else if (res.status === 429) {
+        // Honor the server's Retry-After (bounded: stay inside the worker
+        // budget), then retry - possibly with the next client_id from the pool.
+        const ra = Number(res.headers.get("retry-after"));
+        if (Number.isFinite(ra) && ra > 0) lastRetryAfter = ra;
+        await sleep(Math.min(4000, (Number.isFinite(ra) && ra > 0 ? ra : 1) * 1000));
       } else if (res.status !== 401 && res.status !== 403 && res.status !== 404) {
         break; // not a token problem; retrying will not help
       }
@@ -864,7 +1088,12 @@ async function getStreamUrl(transcoding: Transcoding, track?: ScTrack): Promise<
       ta = (await fetchTrackAuthorization(track)) ?? ta;
     }
   }
-  throw new ApiError(502, "upstream", `Could not get the audio stream URL (HTTP ${lastStatus}).`);
+  throw new ApiError(
+    502,
+    "upstream",
+    `Could not get the audio stream URL (HTTP ${lastStatus}).`,
+    lastRetryAfter,
+  );
 }
 
 /** Some media URLs need a track_authorization that resolve didn't include. */
@@ -908,15 +1137,75 @@ function firstVariant(text: string, baseUrl: string): string | null {
   return null;
 }
 
-function parseMediaPlaylist(text: string, baseUrl: string): { init: string | null; segments: string[]; key: string | null } {
+type HlsKey = {
+  line: string;
+  method: string;
+  /** absolute URI (resolved against the playlist URL) */
+  uri: string | null;
+  iv: Uint8Array | null;
+};
+
+function hexToBytes(hex: string): Uint8Array {
+  const clean = hex.length % 2 ? "0" + hex : hex;
+  const out = new Uint8Array(Math.floor(clean.length / 2));
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+
+/** Per HLS spec: when EXT-X-KEY carries no IV, the segment's media sequence number is the IV (128-bit big-endian). */
+function seqIv(seq: number): Uint8Array {
+  const iv = new Uint8Array(16);
+  let n = Math.max(0, Math.floor(seq));
+  for (let i = 15; i >= 0 && n > 0; i--) {
+    iv[i] = n & 0xff;
+    n = Math.floor(n / 256);
+  }
+  return iv;
+}
+
+/**
+ * Real DRM (Widevine/FairPlay: SAMPLE-AES, skd:// or data: key URIs such as
+ * PSSH blobs) vs plain HLS AES-128, whose key URI is handed to every client
+ * that can read the playlist - hls.js and ffmpeg decrypt that transparently,
+ * so we do too.
+ */
+function isDrmKey(key: HlsKey | null): boolean {
+  if (!key) return false;
+  const m = key.method.toUpperCase();
+  if (m === "NONE") return false;
+  if (m === "AES-128" && key.uri && /^https?:/i.test(key.uri)) return false;
+  return true;
+}
+
+function parseMediaPlaylist(text: string, baseUrl: string): {
+  init: string | null;
+  segments: string[];
+  key: HlsKey | null;
+  mediaSequence: number;
+} {
   let init: string | null = null;
-  let key: string | null = null;
+  let key: HlsKey | null = null;
+  let mediaSequence = 0;
   const segments: string[] = [];
   for (const raw of text.split(/\r?\n/)) {
     const line = raw.trim();
     if (!line) continue;
-    if (line.startsWith("#EXT-X-KEY:") || line.startsWith("#EXT-X-SESSION-KEY:")) {
-      key = key ?? line;
+    if (line.startsWith("#EXT-X-MEDIA-SEQUENCE:")) {
+      const n = Number(line.slice("#EXT-X-MEDIA-SEQUENCE:".length));
+      if (Number.isInteger(n)) mediaSequence = n;
+    } else if (line.startsWith("#EXT-X-KEY:") || line.startsWith("#EXT-X-SESSION-KEY:")) {
+      if (!key) {
+        const method = (line.match(/METHOD=([^,\s]+)/i)?.[1] ?? "").toUpperCase();
+        const uriRaw = line.match(/URI="([^"]+)"/i)?.[1] ?? null;
+        const ivHex = line.match(/IV=0x([0-9a-fA-F]+)/i)?.[1] ?? null;
+        key = {
+          line,
+          method,
+          uri: uriRaw ? new URL(uriRaw, baseUrl).href : null,
+          iv: ivHex ? hexToBytes(ivHex) : null,
+        };
+        if (method === "NONE") key = null;
+      }
     } else if (line.startsWith("#EXT-X-MAP:")) {
       const m = line.match(/URI="([^"]+)"/);
       if (m) init = new URL(m[1], baseUrl).href;
@@ -924,11 +1213,60 @@ function parseMediaPlaylist(text: string, baseUrl: string): { init: string | nul
       segments.push(new URL(line, baseUrl).href);
     }
   }
-  return { init, segments, key };
+  return { init, segments, key, mediaSequence };
+}
+
+/** Fetch the AES-128 key of a plain-encrypted HLS rendition (16 bytes). */
+async function fetchHlsAesKey(key: HlsKey): Promise<Uint8Array | null> {
+  if (isDrmKey(key) || !key.uri) return null;
+  try {
+    const res = await fetch(key.uri, {
+      headers: { "User-Agent": UA },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) return null;
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    if (bytes.length >= 16) return bytes.slice(0, 16);
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function aesCbcDecrypt(seg: Uint8Array, key: Uint8Array, iv: Uint8Array): Promise<Uint8Array | null> {
+  try {
+    const k = await crypto.subtle.importKey("raw", key as unknown as BufferSource, "AES-CBC", false, ["decrypt"]);
+    const out = await crypto.subtle.decrypt(
+      { name: "AES-CBC", iv: iv as unknown as BufferSource },
+      k,
+      seg as unknown as BufferSource,
+    );
+    return new Uint8Array(out);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Decrypt one fetched HLS part when it actually is encrypted. Packagers differ
+ * on whether the init segment is encrypted, so trust the container sniff: a
+ * part that already parses as a known container is clear, anything else gets
+ * the AES-128-CBC treatment and is kept only if it then parses.
+ */
+async function hlsDecryptPart(
+  part: Uint8Array,
+  key: HlsKey | null,
+  keyBytes: Uint8Array | null,
+  iv: Uint8Array,
+): Promise<Uint8Array> {
+  if (!key || isDrmKey(key) || !keyBytes) return part;
+  if (containerOf(part) !== "unknown") return part; // already clear
+  const dec = await aesCbcDecrypt(part, keyBytes, iv);
+  return dec && containerOf(dec) !== "unknown" ? dec : part;
 }
 
 /** Download an HLS rendition: returns all parts and the sniffed container. */
-async function assembleHls(playlistUrl: string): Promise<{ bytes: Uint8Array; container: string; key: string | null; debug: Record<string, unknown> }> {
+async function assembleHls(playlistUrl: string): Promise<{ bytes: Uint8Array; container: string; key: HlsKey | null; debug: Record<string, unknown> }> {
   const head = await fetch(playlistUrl, {
     headers: { "User-Agent": UA },
     signal: AbortSignal.timeout(20000),
@@ -949,20 +1287,31 @@ async function assembleHls(playlistUrl: string): Promise<{ bytes: Uint8Array; co
     baseUrl = variant;
   }
 
-  const { init, segments, key } = parseMediaPlaylist(text, baseUrl);
+  const { init, segments, key, mediaSequence } = parseMediaPlaylist(text, baseUrl);
   if (segments.length === 0) throw new ApiError(502, "upstream", "HLS playlist has no segments.");
-  if (key) {
+  if (isDrmKey(key)) {
     // fail fast: no point downloading segments we cannot play
-    throw new ApiError(415, "drm_protected", `rendition is DRM-encrypted (${key.slice(0, 80)})`);
+    throw new ApiError(415, "drm_protected", `rendition is DRM-encrypted (${key!.line.slice(0, 80)})`);
+  }
+  const keyBytes = key ? await fetchHlsAesKey(key) : null;
+  if (key && !keyBytes) {
+    throw new ApiError(502, "upstream", "HLS AES-128 key fetch failed.");
   }
 
-  const urls = (init ? [init] : []).concat(segments);
+  const items: { url: string; seq: number }[] = [];
+  if (init) items.push({ url: init, seq: mediaSequence });
+  segments.forEach((u, j) => items.push({ url: u, seq: mediaSequence + j }));
   const parts: Uint8Array[] = [];
   const CONCURRENCY = 8;
-  for (let i = 0; i < urls.length; i += CONCURRENCY) {
-    const batch = urls.slice(i, i + CONCURRENCY);
-    const got = await Promise.all(batch.map((u) => fetchBytes(u)));
-    parts.push(...got);
+  for (let i = 0; i < items.length; i += CONCURRENCY) {
+    const batch = items.slice(i, i + CONCURRENCY);
+    const got = await Promise.all(batch.map((it) => fetchBytes(it.url)));
+    const dec: Uint8Array[] = [];
+    for (let j = 0; j < got.length; j++) {
+      const iv = key?.iv ?? seqIv(batch[j].seq);
+      dec.push(await hlsDecryptPart(got[j], key, keyBytes, iv));
+    }
+    parts.push(...dec);
   }
   return {
     bytes: concatBytes(parts),
@@ -972,6 +1321,7 @@ async function assembleHls(playlistUrl: string): Promise<{ bytes: Uint8Array; co
       playlist: text.slice(0, 2500),
       init_present: Boolean(init),
       segment_count: segments.length,
+      key_method: key?.method ?? "NONE",
     },
   };
 }
@@ -1691,12 +2041,51 @@ function windowFrames(bytes: Uint8Array, srcExt: string, fromSec: number, toSec:
   return concatBytes(keep);
 }
 
+/** Response body assembly for chunk=all from the server-side chunk cache. */
+async function assembleFromCache(
+  track: ScTrack,
+  meta: ReturnType<typeof trackMeta>,
+  fmt: string,
+  count: number,
+): Promise<Response> {
+  const trackKey = String(track.id);
+  const keys = Array.from({ length: count }, (_, i) => chunkKey(trackKey, fmt, i));
+  const rows = await cacheGetMany(keys);
+  const missing: number[] = [];
+  for (let i = 0; i < count; i++) if (!rows.has(keys[i])) missing.push(i);
+  if (missing.length > 0) {
+    throw new ApiError(
+      409,
+      "chunks_not_cached",
+      `${missing.length} of ${count} ${fmt} chunks for this track are not in the server cache yet. ` +
+      `Fetch them first (&chunk=${missing[0]}${missing.length > 1 ? " .. &chunk=" + missing[missing.length - 1] : ""}; ` +
+      `each request converts one chunk), then repeat this request.`,
+      undefined,
+      { missing, chunk_count: count, chunk_seconds: CHUNK_SECONDS, format: fmt },
+    );
+  }
+  const bytes = concatBytes(keys.map((k) => rows.get(k)!));
+  const { ext, mime } = fmtExtMime(fmt);
+  const h = audioHeaders(meta, ext, mime, `assembled from ${count} cached chunks`, false, bytes.length);
+  h.set("X-SSDA-Chunk-Count", String(count));
+  h.set("X-SSDA-Cache", "hit");
+  return new Response(bytes, { status: 200, headers: h });
+}
+
 /**
- * Serve one conversion chunk (or the chunk plan for chunk=info). Chunk
- * requests convert at most one ~CHUNK_SECONDS window of audio, staying well
- * inside the per-request compute budget.
+ * Serve one conversion chunk (or the chunk plan for chunk=info, or the whole
+ * file from cache for chunk=all). Chunk requests convert at most one
+ * ~CHUNK_SECONDS window of audio, staying well inside the per-request compute
+ * budget; converted chunks and whole files land in the server-side cache so
+ * repeat requests never touch SoundCloud again.
  */
-async function serveChunk(track: ScTrack, meta: ReturnType<typeof trackMeta>, cand: Candidate, fmt: string, sel: number | "info"): Promise<Response> {
+async function serveChunk(
+  track: ScTrack,
+  meta: ReturnType<typeof trackMeta>,
+  cand: Candidate,
+  fmt: string,
+  sel: number | "info" | "all",
+): Promise<Response> {
   if (fmt === "m4a") {
     throw new ApiError(
       400,
@@ -1704,11 +2093,44 @@ async function serveChunk(track: ScTrack, meta: ReturnType<typeof trackMeta>, ca
       "m4a files cannot be assembled from chunks. Use format=mp3 (or format=opus) for long tracks, or a track shorter than 25 s.",
     );
   }
+  const trackKey = String(track.id);
+  const cMetaKey = chunkMetaKey(trackKey, fmt);
+  const numKey = typeof sel === "number" ? chunkKey(trackKey, fmt, sel) : null;
+  const early = await cacheGetMany(numKey ? [cMetaKey, numKey] : [cMetaKey]);
+  const metaParsed = parseMetaJson(early.get(cMetaKey));
+  const cachedCount = metaParsed && metaParsed.cs === CHUNK_SECONDS && Number.isInteger(metaParsed.count)
+    ? metaParsed.count as number
+    : null;
+  const cachedChunkSeconds = metaParsed && Number.isInteger(metaParsed.chunk_seconds)
+    ? metaParsed.chunk_seconds as number
+    : 0;
+
+  const planResponse = (count: number, chunkSeconds: number, cache: string): Response => {
+    const res = jsonResponse({ chunk_count: count, chunk_seconds: chunkSeconds, format: fmt });
+    res.headers.set("X-SSDA-Cache", cache);
+    return res;
+  };
+  const chunkResponse = (bytes: Uint8Array, idx: number, count: number, cache: string): Response => {
+    const { ext, mime } = fmtExtMime(fmt);
+    const h = audioHeaders(meta, ext, mime, `${cache === "hit" ? "cached" : "converted"} chunk ${idx}/${count}`, false, bytes.length);
+    h.set("X-SSDA-Chunk-Index", String(idx));
+    h.set("X-SSDA-Chunk-Count", String(count));
+    h.set("X-SSDA-Cache", cache);
+    return new Response(bytes, { status: 200, headers: h });
+  };
+
+  // Cache fast paths: serve without touching SoundCloud at all.
+  if (cachedCount !== null && sel === "info") return planResponse(cachedCount, cachedChunkSeconds, "hit");
+  if (cachedCount !== null && sel === "all") return await assembleFromCache(track, meta, fmt, cachedCount);
+  if (cachedCount !== null && numKey && early.get(numKey)) {
+    return chunkResponse(early.get(numKey)!, sel as number, cachedCount, "hit");
+  }
+
   let streamUrl: string;
   try {
     streamUrl = await getStreamUrl(cand.transcoding, track);
   } catch (err) {
-    if (err instanceof ApiError) throw new ApiError(err.status, err.code, `streamurl: ${err.message}`);
+    if (err instanceof ApiError) throw new ApiError(err.status, err.code, `streamurl: ${err.message}`, err.retryAfter);
     throw err;
   }
   const proto = cand.transcoding.format?.protocol || "";
@@ -1724,10 +2146,12 @@ async function serveChunk(track: ScTrack, meta: ReturnType<typeof trackMeta>, ca
     const durSec = (track.duration ?? 0) / 1000;
     count = Math.max(1, Math.ceil(durSec / CHUNK_SECONDS));
     if (sel === "info") {
-      return jsonResponse({ chunk_count: count, chunk_seconds: CHUNK_SECONDS, format: fmt });
+      await cacheSet(cMetaKey, metaJsonBytes({ count, cs: CHUNK_SECONDS, chunk_seconds: CHUNK_SECONDS }));
+      return planResponse(count, CHUNK_SECONDS, "miss");
     }
+    if (sel === "all") return await assembleFromCache(track, meta, fmt, count);
     if (!(sel >= 0) || sel >= count) {
-      throw new ApiError(404, "invalid_chunk", `chunk must be between 0 and ${count - 1} (or 'info').`);
+      throw new ApiError(404, "invalid_chunk", `chunk must be between 0 and ${count - 1} (or 'info' / 'all').`);
     }
     const bytes = await fetchBytes(streamUrl, 2);
     const container = containerOf(bytes);
@@ -1758,19 +2182,31 @@ async function serveChunk(track: ScTrack, meta: ReturnType<typeof trackMeta>, ca
       text = await vres.text();
       baseUrl = variant;
     }
-    const { init, segments, key } = parseMediaPlaylist(text, baseUrl);
-    if (key) throw new ApiError(415, "drm_protected", `rendition is DRM-encrypted (${key.slice(0, 80)})`);
+    const { init, segments, key, mediaSequence } = parseMediaPlaylist(text, baseUrl);
+    if (isDrmKey(key)) {
+      throw new ApiError(415, "drm_protected", `rendition is DRM-encrypted (${key!.line.slice(0, 80)})`);
+    }
     if (!segments.length) throw new ApiError(502, "upstream", "HLS playlist has no segments.");
     count = segments.length;
     if (sel === "info") {
-      return jsonResponse({ chunk_count: count, chunk_seconds: 0, format: fmt });
+      await cacheSet(cMetaKey, metaJsonBytes({ count, cs: CHUNK_SECONDS, chunk_seconds: 0 }));
+      return planResponse(count, 0, "miss");
     }
+    if (sel === "all") return await assembleFromCache(track, meta, fmt, count);
     if (!(sel >= 0) || sel >= count) {
-      throw new ApiError(404, "invalid_chunk", `chunk must be between 0 and ${count - 1} (or 'info').`);
+      throw new ApiError(404, "invalid_chunk", `chunk must be between 0 and ${count - 1} (or 'info' / 'all').`);
     }
-    const urls = (init ? [init] : []).concat([segments[sel]]);
-    const got = await Promise.all(urls.map((u) => fetchBytes(u)));
-    const raw = concatBytes(got);
+    const keyBytes = key ? await fetchHlsAesKey(key) : null;
+    if (key && !keyBytes) throw new ApiError(502, "upstream", "HLS AES-128 key fetch failed.");
+    const items = (init ? [{ url: init, seq: mediaSequence }] : [])
+      .concat([{ url: segments[sel], seq: mediaSequence + sel }]);
+    const got = await Promise.all(items.map((it) => fetchBytes(it.url)));
+    const dec: Uint8Array[] = [];
+    for (let j = 0; j < got.length; j++) {
+      const iv = key?.iv ?? seqIv(items[j].seq);
+      dec.push(await hlsDecryptPart(got[j], key, keyBytes, iv));
+    }
+    const raw = concatBytes(dec);
     const container = containerOf(raw);
     if (container === "ts") {
       const adts = tsToAdts(raw);
@@ -1798,7 +2234,7 @@ async function serveChunk(track: ScTrack, meta: ReturnType<typeof trackMeta>, ca
   } catch (err) {
     if (window.length === 0) {
       // chunk past the end of the audio: an empty tail is fine to concatenate
-      const m = fmt === "mp3" ? { ext: "mp3", mime: "audio/mpeg" } : { ext: "opus", mime: "audio/ogg" };
+      const m = fmtExtMime(fmt);
       out = { bytes: new Uint8Array(0), ...m, container: m.ext };
     } else if (err instanceof ApiError) {
       throw err;
@@ -1806,10 +2242,13 @@ async function serveChunk(track: ScTrack, meta: ReturnType<typeof trackMeta>, ca
       throw new ApiError(415, "conversion_failed", cleanMessage(err instanceof Error ? err.message : String(err)));
     }
   }
-  const h = audioHeaders(meta, out.ext, out.mime, `converted chunk ${sel}/${count}`, false, out.bytes.length);
-  h.set("X-SSDA-Chunk-Index", String(sel));
-  h.set("X-SSDA-Chunk-Count", String(count));
-  return new Response(out.bytes, { status: 200, headers: h });
+  if (numKey && out.bytes.length > 0) {
+    await Promise.all([
+      cacheSet(cMetaKey, metaJsonBytes({ count, cs: CHUNK_SECONDS, chunk_seconds: isDirect ? CHUNK_SECONDS : 0 })),
+      cacheSet(numKey, out.bytes),
+    ]);
+  }
+  return chunkResponse(out.bytes, sel as number, count, "miss");
 }
 
 /**
@@ -1818,7 +2257,7 @@ async function serveChunk(track: ScTrack, meta: ReturnType<typeof trackMeta>, ca
  * once (legacy stream + media URLs together); a fresh pass with a new
  * client_id usually recovers within a second or two.
  */
-async function serveAudio(url: string, fmt: string, attachment: boolean, chunkSel: number | "info" | null): Promise<Response> {
+async function serveAudio(url: string, fmt: string, attachment: boolean, chunkSel: number | "info" | "all" | null): Promise<Response> {
   let lastErr: unknown = null;
   for (let pass = 0; pass < 3; pass++) {
     if (pass > 0) {
@@ -1834,33 +2273,82 @@ async function serveAudio(url: string, fmt: string, attachment: boolean, chunkSe
     }
   }
   if (lastErr instanceof ApiError && lastErr.code === "upstream" && lastErr.status === 502) {
-    throw new ApiError(502, "upstream", `${lastErr.message} This is often transient - try again in a few seconds.`);
+    throw new ApiError(
+      502,
+      "upstream",
+      `${lastErr.message} This is often transient - try again in a few seconds.`,
+      lastErr.retryAfter ?? 30,
+    );
   }
   throw lastErr;
 }
 
-async function serveAudioPass(url: string, fmt: string, attachment: boolean, chunkSel: number | "info" | null): Promise<Response> {
+async function serveAudioPass(url: string, fmt: string, attachment: boolean, chunkSel: number | "info" | "all" | null): Promise<Response> {
   const track = await resolveTrack(url);
   const meta = trackMeta(track, url);
+
+  // Whole-file cache: a repeat request for this track+format serves straight
+  // from storage - no stream URLs, no downloads, no conversion.
+  const fKey = fullKey(track.id, fmt);
+  const fmKey = fullMetaKey(track.id, fmt);
+  const cached = await cacheGetMany([fmKey, fKey]);
+  const fmParsed = parseMetaJson(cached.get(fmKey));
+  const fRaw = cached.get(fKey);
+  if (fmParsed && fRaw && typeof fmParsed.ext === "string" && typeof fmParsed.mime === "string") {
+    const h = audioHeaders(
+      meta,
+      fmParsed.ext as string,
+      fmParsed.mime as string,
+      typeof fmParsed.note === "string" ? fmParsed.note : "cached",
+      attachment,
+      fRaw.length,
+    );
+    h.set("X-SSDA-Cache", "hit");
+    return new Response(fRaw, { status: 200, headers: h });
+  }
+
   const candidates = buildCandidates(track, fmt);
 
   // Chunked conversion: serve the chunk plan or exactly one chunk window.
   if (chunkSel !== null && fmt !== "auto") {
     let lastErr: ApiError | null = null;
+    let legacyStatus = 0;
+    let drmSeen = false;
     for (const cand of candidates) {
-      if (cand.encrypted) break;
+      if (cand.encrypted) {
+        drmSeen = true;
+        break;
+      }
       try {
         return await serveChunk(track, meta, cand, fmt, chunkSel);
       } catch (err) {
-        if (err instanceof ApiError && (err.code === "invalid_chunk" || err.code === "chunking_not_supported_for_format")) throw err;
+        if (err instanceof ApiError && (err.code === "invalid_chunk" || err.code === "chunking_not_supported_for_format" || err.code === "chunks_not_cached")) throw err;
         if (err instanceof ApiError) {
+          if (cand.legacy) legacyStatus = Number((err.message.match(/HTTP (\d+)/) ?? [])[1] ?? 0);
           const tag = `[cand=${cand.kind}${cand.legacy ? ",legacy" : ""}${cand.download ? ",dl" : ""}]`;
-          lastErr = new ApiError(err.status, err.code, `${err.message} ${tag}`);
+          lastErr = new ApiError(err.status, err.code, `${err.message} ${tag}`, err.retryAfter, err.details);
           continue;
         }
         const msg = err instanceof Error ? err.message : String(err);
         throw new ApiError(500, "internal", cleanMessage(`${msg} [cand=${cand.kind}${cand.legacy ? ",legacy" : ""}]`));
       }
+    }
+    // Same end-of-loop priority as the whole-track path: transient legacy
+    // throttling first, then the honest DRM answer, then the last real error.
+    if (legacyStatus === 429) {
+      throw new ApiError(
+        502,
+        "upstream",
+        `SoundCloud's free stream endpoint is rate-limiting us right now (HTTP 429)${drmSeen ? " and this track's other renditions are DRM-protected" : ""}. This is usually temporary - try again in a minute or two.`,
+        90,
+      );
+    }
+    if (drmSeen) {
+      throw new ApiError(
+        415,
+        "drm_protected",
+        "SoundCloud serves only DRM-encrypted audio for this track (Widevine/FairPlay-protected renditions) and offers no plain download file. SlopCloud does not fetch DRM license keys or use subscriber sessions; if you have the audio file, the site can save it to the cache.",
+      );
     }
     throw lastErr ?? new ApiError(403, "not_streamable", "No usable audio rendition found for this track.");
   }
@@ -1880,10 +2368,15 @@ async function serveAudioPass(url: string, fmt: string, attachment: boolean, chu
           : out.container === "ts"
           ? "stream container converted to adts aac"
           : null;
-        return new Response(out.bytes, {
-          status: 200,
-          headers: audioHeaders(meta, out.ext, out.mime, note, attachment, out.bytes.length),
-        });
+        if (out.bytes.length > 0) {
+          await Promise.all([
+            cacheSet(fmKey, metaJsonBytes({ ext: out.ext, mime: out.mime, note })),
+            cacheSet(fKey, out.bytes),
+          ]);
+        }
+        const h = audioHeaders(meta, out.ext, out.mime, note, attachment, out.bytes.length);
+        h.set("X-SSDA-Cache", "miss");
+        return new Response(out.bytes, { status: 200, headers: h });
       }
     } catch (err) {
       if (cand.legacy && err instanceof ApiError) {
@@ -1913,10 +2406,16 @@ async function serveAudioPass(url: string, fmt: string, attachment: boolean, chu
     }
     try {
       const out = await convertAudio(source.bytes, source.ext, fmt);
-      return new Response(out.bytes, {
-        status: 200,
-        headers: audioHeaders(meta, out.ext, out.mime, `converted from ${source.ext} to ${out.ext}`, attachment, out.bytes.length),
-      });
+      const note = `converted from ${source.ext} to ${out.ext}`;
+      if (out.bytes.length > 0) {
+        await Promise.all([
+          cacheSet(fmKey, metaJsonBytes({ ext: out.ext, mime: out.mime, note })),
+          cacheSet(fKey, out.bytes),
+        ]);
+      }
+      const h = audioHeaders(meta, out.ext, out.mime, note, attachment, out.bytes.length);
+      h.set("X-SSDA-Cache", "miss");
+      return new Response(out.bytes, { status: 200, headers: h });
     } catch (err) {
       if (err instanceof ApiError && err.code === "codec_unavailable") throw err;
       // Never silently hand back the wrong format when one was requested,
@@ -1938,13 +2437,14 @@ async function serveAudioPass(url: string, fmt: string, attachment: boolean, chu
       502,
       "upstream",
       `SoundCloud's free stream endpoint is rate-limiting us right now (HTTP 429)${drmOnly ? " and this track's other renditions are DRM-protected" : ""}. This is usually temporary - try again in a minute or two.`,
+      90,
     );
   }
   if (lastErr?.code === "drm_protected") {
     throw new ApiError(
       415,
       "drm_protected",
-      "SoundCloud serves only DRM-encrypted audio for this track and offers no download file. SlopCloud will not serve encrypted bytes; if you have the audio file, the site can save it to the cache.",
+      "SoundCloud serves only DRM-encrypted audio for this track (Widevine/FairPlay-protected renditions) and offers no plain download file. SlopCloud does not fetch DRM license keys or use subscriber sessions; if you have the audio file, the site can save it to the cache.",
     );
   }
   if (
@@ -2141,7 +2641,13 @@ export async function handleRequest(req: Request): Promise<Response> {
       return jsonResponse(serviceIndex());
     }
     if (path === "/api/health") {
-      return jsonResponse({ ok: true, name: SERVICE_NAME, version: VERSION });
+      return jsonResponse({
+        ok: true,
+        name: SERVICE_NAME,
+        version: VERSION,
+        cache: cacheBase() ? "on" : "off",
+        cache_error: cacheLastError,
+      });
     }
     if (path === "/api/info") {
       const link = validateSoundcloudUrl(url.searchParams.get("url") || "");
@@ -2181,9 +2687,13 @@ export async function handleRequest(req: Request): Promise<Response> {
         return await runStage(link, url.searchParams.get("step") || "wasm");
       }
       const chunkRaw = url.searchParams.get("chunk");
-      const chunkSel: number | "info" | null = chunkRaw === "info" ? "info" : chunkRaw !== null ? Number(chunkRaw) : null;
-      if (chunkRaw !== null && chunkSel !== "info" && !(Number.isInteger(chunkSel) && (chunkSel as number) >= 0)) {
-        throw new ApiError(400, "invalid_chunk", "chunk must be a non-negative integer or 'info'.");
+      const chunkSel: number | "info" | "all" | null =
+        chunkRaw === "info" ? "info"
+        : chunkRaw === "all" ? "all"
+        : chunkRaw !== null ? Number(chunkRaw)
+        : null;
+      if (chunkRaw !== null && chunkSel !== "info" && chunkSel !== "all" && !(Number.isInteger(chunkSel) && (chunkSel as number) >= 0)) {
+        throw new ApiError(400, "invalid_chunk", "chunk must be a non-negative integer, 'info', or 'all'.");
       }
       return await serveAudio(link, fmt, path === "/api/download", chunkSel);
     }

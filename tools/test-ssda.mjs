@@ -9,6 +9,7 @@ import { register } from "node:module";
 import { readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createCipheriv } from "node:crypto";
 register("./npm-hook.mjs", import.meta.url);
 
 import { Conversion, Input, Output, BufferTarget, BufferSource, Mp3OutputFormat, Mp4OutputFormat, WaveInputFormat } from "mediabunny";
@@ -18,6 +19,7 @@ import { registerAacEncoder } from "@mediabunny/aac-encoder";
 const { handleRequest } = await import("../supabase/functions/ssda/index.ts");
 
 const CID = "CID1234567890abcdefghij";
+const CID2 = "CID2stuvwxz0123456789ab";
 const BASE = "https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/ssda";
 
 // ---------- fixtures ----------
@@ -553,6 +555,80 @@ function makeTs() {
   return new Uint8Array([...pkt, ...pkt]); // two packets -> container sniffing sees sync at 0 and 188
 }
 
+// ---- plain AES-128 HLS (encrypted-hls): key served to any client, so the
+// pipeline must decrypt it like any HLS client (vs cbc-/ctr- DRM, refused).
+const AES_KEY = new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+const AES_IV = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+function aesEncrypt(bytes, key, iv) {
+  const cipher = createCipheriv("aes-128-cbc", Buffer.from(key), Buffer.from(iv));
+  return new Uint8Array(Buffer.concat([cipher.update(Buffer.from(bytes)), cipher.final()]));
+}
+const aesSegEnc = aesEncrypt(stypFmp4.frags, AES_KEY, AES_IV);
+const aesSegEncSeq = aesEncrypt(stypFmp4.frags, AES_KEY, new Uint8Array(16)); // IV = media sequence 0
+
+const aesMediaPlaylist = [
+  "#EXTM3U",
+  '#EXT-X-KEY:METHOD=AES-128,URI="https://cf-hls-media.sndcdn.com/aes/key.bin",IV=0x0102030405060708090a0b0c0d0e0f10',
+  '#EXT-X-MAP:URI="init.mp4"',
+  "#EXTINF:1.0,",
+  "frag.enc",
+  "#EXT-X-ENDLIST",
+].join("\n");
+
+const aesNoIvMediaPlaylist = [
+  "#EXTM3U",
+  "#EXT-X-MEDIA-SEQUENCE:0",
+  '#EXT-X-KEY:METHOD=AES-128,URI="https://cf-hls-media.sndcdn.com/aes/key.bin"',
+  '#EXT-X-MAP:URI="init.mp4"',
+  "#EXTINF:1.0,",
+  "frag2.enc",
+  "#EXT-X-ENDLIST",
+].join("\n");
+
+const aesChunkFixture = {
+  kind: "track",
+  id: 830,
+  title: "AES HLS",
+  duration: 1000,
+  permalink_url: "https://soundcloud.com/test/aes-hls",
+  user: { username: "a" },
+  media: {
+    transcodings: [
+      { url: "https://api-v2.soundcloud.com/media/soundcloud:tracks:830/stream/encrypted-hls", format: { protocol: "encrypted-hls", mime_type: 'audio/mp4; codecs="mp4a.40.2"' }, quality: "sq" },
+    ],
+  },
+};
+
+const aesNoIvFixture = {
+  kind: "track",
+  id: 831,
+  title: "AES HLS No IV",
+  duration: 1000,
+  permalink_url: "https://soundcloud.com/test/aes-noiv",
+  user: { username: "a" },
+  media: {
+    transcodings: [
+      { url: "https://api-v2.soundcloud.com/media/soundcloud:tracks:831/stream/encrypted-hls", format: { protocol: "encrypted-hls", mime_type: 'audio/mp4; codecs="mp4a.40.2"' }, quality: "sq" },
+    ],
+  },
+};
+
+// progressive stream that rejects the first pooled client_id: the pool must
+// rotate to the next id instead of failing (or re-scraping under pressure)
+const poolFixture = {
+  kind: "track",
+  id: 833,
+  title: "Pool Rotation",
+  duration: 6000,
+  permalink_url: "https://soundcloud.com/test/poolrot",
+  user: { username: "p" },
+  media: {
+    transcodings: [
+      { url: "https://api-v2.soundcloud.com/media/soundcloud:tracks:833/stream/poolrot", format: { protocol: "progressive", mime_type: "audio/mpeg" }, quality: "sq" },
+    ],
+  },
+};
+
 // ---------- mock network ----------
 
 const realFetch = globalThis.fetch;
@@ -565,6 +641,7 @@ let drmFlakyCalls = 0;
 let legacy429Calls = 0;
 let blockMode = false;
 let failCdn = false;
+const cacheDb = new Map(); // emulates PostgREST over the ssda_cache table
 
 const goodHome = `<html><script src="https://a-v2.sndcdn.com/assets/0-old.js"></script>
   <script crossorigin src="//a-v2.sndcdn.com/assets/99-app.js"></script></html>`;
@@ -597,6 +674,9 @@ globalThis.fetch = async (input, init) => {
   if (u.includes("a-v2.sndcdn.com/assets/99-app.js")) {
     return R(`var cfg={client_id:"${CID}",foo:1};`);
   }
+  if (u.includes("a-v2.sndcdn.com/assets/0-old.js")) {
+    return R(`var cfg2={client_id:"${CID2}"};`);
+  }
   if (u.includes("a-v2.sndcdn.com/assets/")) {
     return R("var nothing=1;");
   }
@@ -613,6 +693,10 @@ globalThis.fetch = async (input, init) => {
     if (target.includes("all-down")) return J(allDownFixture);
     if (target.includes("conv-mp3chunk")) return J(convMp3ChunkFixture);
     if (target.includes("conv-hlschunk")) return J(convHlsChunkFixture);
+    if (target.includes("aes-hls")) return J(aesChunkFixture);
+    if (target.includes("aes-noiv")) return J(aesNoIvFixture);
+    if (target.includes("poolrot")) return J(poolFixture);
+    if (target.includes("resolve-429")) return R("slow down", 429, { "Retry-After": "42" });
     if (target.includes("conv-mp3")) return J(convMp3Fixture);
     if (target.includes("conv-aac")) return J(convAacFixture);
     if (target.includes("conv-long")) return J(convLongFixture);
@@ -657,7 +741,7 @@ globalThis.fetch = async (input, init) => {
       legacy429Calls++;
       return legacy429Calls <= 2 ? R("slow down", 429) : R(realMp3, 200, { "Content-Type": "audio/mpeg" });
     }
-    if (id === "630") return R("slow down", 429);
+    if (id === "630") return R("slow down", 429, { "Retry-After": "7" });
     return R("not found", 404);
   }
   // track endpoint used to fetch a fresh track_authorization
@@ -670,6 +754,13 @@ globalThis.fetch = async (input, init) => {
     return J({ url: "https://cf-media.sndcdn.com/auth.mp3" });
   }
   if (u.includes("/stream/cbc-encrypted-hls")) return J({ url: "https://cf-hls-media.sndcdn.com/drm/playlist.m3u8" });
+  if (u.includes("soundcloud:tracks:830") && u.includes("/stream/encrypted-hls")) return J({ url: "https://cf-hls-media.sndcdn.com/aes/playlist.m3u8" });
+  if (u.includes("soundcloud:tracks:831") && u.includes("/stream/encrypted-hls")) return J({ url: "https://cf-hls-media.sndcdn.com/aes/playlist2.m3u8" });
+  if (u.includes("soundcloud:tracks:833") && u.includes("/stream/poolrot")) {
+    return u.includes("client_id=" + CID2)
+      ? J({ url: "https://cf-media.sndcdn.com/conv/real.mp3" })
+      : J({ error: "nope" }, 401);
+  }
   if (u.includes("/tracks/601/download")) return J({ url: "https://cf-media.sndcdn.com/x1.128.mp3" });
   if (u.includes("/tracks/603/download")) return J({ url: "https://cf-media.sndcdn.com/x3.wav" });
   if (u.includes("/tracks/604/download")) return J({ url: "https://cf-media.sndcdn.com/x4.128.mp3" });
@@ -717,6 +808,12 @@ globalThis.fetch = async (input, init) => {
     return R(new Uint8Array([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x41, 0x56, 0x45, 0, 0]), 200, { "Content-Type": "audio/wav" });
   }
   if (u.startsWith("https://cf-hls-media.sndcdn.com/drm/playlist.m3u8")) return R(drmMediaPlaylist);
+  if (u.startsWith("https://cf-hls-media.sndcdn.com/aes/playlist2.m3u8")) return R(aesNoIvMediaPlaylist);
+  if (u.startsWith("https://cf-hls-media.sndcdn.com/aes/playlist.m3u8")) return R(aesMediaPlaylist);
+  if (u.startsWith("https://cf-hls-media.sndcdn.com/aes/key.bin")) return R(AES_KEY, 200, { "Content-Type": "application/octet-stream" });
+  if (u.startsWith("https://cf-hls-media.sndcdn.com/aes/init.mp4")) return R(stypFmp4.init);
+  if (u.startsWith("https://cf-hls-media.sndcdn.com/aes/frag2.enc")) return R(aesSegEncSeq);
+  if (u.startsWith("https://cf-hls-media.sndcdn.com/aes/frag.enc")) return R(aesSegEnc);
   if (u === "https://cf-hls-media.sndcdn.com/styp/playlist.m3u8") return R(stypMediaPlaylist);
   if (u === "https://cf-hls-media.sndcdn.com/styp/init.styp") return R(stypInit, 200, { "Content-Type": "video/mp4" });
   if (u === "https://cf-hls-media.sndcdn.com/styp/seg1.styp") return R(stypSegment, 200, { "Content-Type": "video/mp4" });
@@ -773,6 +870,29 @@ globalThis.fetch = async (input, init) => {
   }
   if (u.startsWith("https://on.soundcloud.com/shortbad")) {
     return R(null, 200);
+  }
+  // emulated PostgREST over the ssda_cache table (server-side response cache)
+  if (u.startsWith("https://supabase.test/rest/v1/ssda_cache")) {
+    const parsed = new URL(u);
+    if (method === "GET") {
+      const raw = parsed.searchParams.get("cache_key") ?? "";
+      const m = raw.match(/^in\.\((.*)\)$/);
+      const keys = m
+        ? m[1].split(",").map((s) => decodeURIComponent(s.replace(/^"|"$/g, "")))
+        : raw ? [decodeURIComponent(raw.replace(/^eq\./, ""))] : [];
+      return J(keys.filter((k) => cacheDb.has(k)).map((k) => ({ cache_key: k, data: cacheDb.get(k) })));
+    }
+    if (method === "POST") {
+      for (const row of JSON.parse(String(init && init.body ? init.body : "[]"))) {
+        cacheDb.set(row.cache_key, row.data);
+      }
+      return R("", 204);
+    }
+    if (method === "DELETE") {
+      cacheDb.clear();
+      return R("", 204);
+    }
+    return R("bad request", 400);
   }
   console.log("UNMOCKED FETCH:", u);
   return realFetch(input);
@@ -1274,6 +1394,112 @@ async function call(path, init) {
 
   const h9 = await call("/api/audio?url=" + H + "&format=mp3&chunk=2");
   ok(h9.status === 404, "hls chunk past the end -> 404", String(h9.status));
+}
+
+// 13. plain AES-128 HLS (encrypted-hls): the key URI is served to every client
+// that can read the playlist (hls.js and ffmpeg decrypt it transparently), so
+// the pipeline decrypts it too - unlike cbc-/ctr-encrypted-hls (Widevine/
+// FairPlay) which stay refused with an honest error.
+{
+  console.log("encrypted-hls (plain AES-128):");
+  const A = encodeURIComponent("https://soundcloud.com/test/aes-hls");
+  const info = await (await call("/api/audio?url=" + A + "&format=mp3&chunk=info")).json();
+  ok(info.chunk_count === 1, "aes-hls chunk plan", JSON.stringify(info));
+
+  const chunk = await call("/api/audio?url=" + A + "&format=mp3&chunk=0");
+  const cb = new Uint8Array(await chunk.arrayBuffer());
+  ok(chunk.status === 200 && chunk.headers.get("X-SSDA-Extension") === "mp3",
+    "aes-hls chunk decrypts + converts", String(chunk.status));
+  ok(cb.length > 1000 && cb[0] === 0xff, "aes-hls chunk is real mp3", "len=" + cb.length);
+
+  const chunk2 = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/aes-noiv") + "&format=mp3&chunk=0");
+  const cb2 = new Uint8Array(await chunk2.arrayBuffer());
+  ok(chunk2.status === 200 && cb2.length > 1000 && cb2[0] === 0xff,
+    "aes-hls without IV attribute (media-sequence IV) converts", String(chunk2.status) + " len=" + cb2.length);
+
+  const whole = await call("/api/audio?url=" + A + "&format=mp3");
+  const wb = new Uint8Array(await whole.arrayBuffer());
+  ok(whole.status === 200 && wb.length > 1000 && wb[0] === 0xff,
+    "aes-hls whole-track path decrypts too", String(whole.status) + " len=" + wb.length);
+
+  const drm = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/drm-only") + "&format=mp3&chunk=0");
+  const drmBody = await drm.json();
+  ok(drm.status === 415 && drmBody.error.code === "drm_protected" && /Widevine|FairPlay|DRM-encrypted/.test(drmBody.error.message),
+    "cbc/ctr DRM still refused, chunked path included", JSON.stringify(drmBody));
+}
+
+// 14. Retry-After is honored and echoed to clients
+{
+  console.log("retry-after:");
+  const r = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/resolve-429"));
+  const rb = await r.json();
+  ok(r.status === 429 && rb.error.code === "rate_limited" && rb.error.retry_after_seconds === 42 && r.headers.get("Retry-After") === "42",
+    "resolve 429 echoes Retry-After", JSON.stringify(rb.error) + " hdr=" + r.headers.get("Retry-After"));
+
+  const l = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/legacy-429-drm"));
+  const lb = await l.json();
+  ok(l.status === 502 && /rate-limiting/.test(lb.error.message) && lb.error.retry_after_seconds === 90 && l.headers.get("Retry-After") === "90",
+    "legacy 429 failure carries Retry-After", JSON.stringify(lb.error) + " hdr=" + l.headers.get("Retry-After"));
+}
+
+// 15. client_id pool: a poisoned id rotates to the next pooled id
+{
+  console.log("client_id pool:");
+  const rot = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/poolrot"));
+  const rb = new Uint8Array(await rot.arrayBuffer());
+  ok(rot.status === 200 && rb.length > 5, "stream recovered via the next pooled client_id", String(rot.status) + " len=" + rb.length);
+}
+
+// 16. server-side cache + chunk=all assembly (opt-in via SUPABASE_URL env)
+{
+  console.log("server cache + chunk=all:");
+  process.env.SUPABASE_URL = "https://supabase.test";
+  process.env.SUPABASE_SERVICE_ROLE_KEY = "svc-test";
+  const H = encodeURIComponent("https://soundcloud.com/test/conv-hlschunk");
+
+  const c0 = await call("/api/audio?url=" + H + "&format=mp3&chunk=0");
+  const c0b = new Uint8Array(await c0.arrayBuffer());
+  ok(c0.status === 200 && c0.headers.get("X-SSDA-Cache") === "miss", "first chunk is a cache miss", String(c0.headers.get("X-SSDA-Cache")));
+
+  const c0again = await call("/api/audio?url=" + H + "&format=mp3&chunk=0");
+  const c0againB = new Uint8Array(await c0again.arrayBuffer());
+  ok(c0again.headers.get("X-SSDA-Cache") === "hit" && c0againB.length === c0b.length,
+    "repeat chunk served from the server cache", String(c0again.headers.get("X-SSDA-Cache")));
+  ok(cacheDb.size >= 2, "cache rows were stored", "rows=" + cacheDb.size);
+
+  const info = await call("/api/audio?url=" + H + "&format=mp3&chunk=info");
+  const infoB = await info.json();
+  ok(info.headers.get("X-SSDA-Cache") === "hit" && infoB.chunk_count === 2 && infoB.chunk_seconds === 0,
+    "chunk plan served from cache meta (hls keeps chunk_seconds=0)", JSON.stringify(infoB));
+
+  const all1 = await call("/api/audio?url=" + H + "&format=mp3&chunk=all");
+  const all1b = await all1.json();
+  ok(all1.status === 409 && all1b.error.code === "chunks_not_cached" && Array.isArray(all1b.error.missing) && all1b.error.missing.includes(1),
+    "chunk=all before fill lists the missing chunks", JSON.stringify(all1b.error));
+
+  const c1 = await call("/api/audio?url=" + H + "&format=mp3&chunk=1");
+  const c1b = new Uint8Array(await c1.arrayBuffer());
+  ok(c1.status === 200 && c1.headers.get("X-SSDA-Cache") === "miss", "chunk 1 converted and stored", String(c1.status));
+
+  const all2 = await call("/api/audio?url=" + H + "&format=mp3&chunk=all");
+  const all2b = new Uint8Array(await all2.arrayBuffer());
+  ok(all2.status === 200 && all2.headers.get("X-SSDA-Cache") === "hit",
+    "chunk=all assembles from cache once every chunk exists", String(all2.status));
+  ok(all2b.length === c0b.length + c1b.length,
+    "assembled length = sum of chunks", all2b.length + " vs " + (c0b.length + c1b.length));
+  ok(all2b.slice(0, c0b.length).every((v, i) => v === c0b[i]) && all2b.slice(c0b.length).every((v, i) => v === c1b[i]),
+    "assembled bytes = chunks in order");
+
+  const full = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/conv-mp3") + "&format=mp3");
+  const fb = new Uint8Array(await full.arrayBuffer());
+  ok(full.status === 200 && full.headers.get("X-SSDA-Cache") === "miss", "whole file: first request misses");
+  const full2 = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/conv-mp3") + "&format=mp3");
+  const fb2 = new Uint8Array(await full2.arrayBuffer());
+  ok(full2.headers.get("X-SSDA-Cache") === "hit" && fb2.length === fb.length,
+    "whole file served from the server cache", String(full2.headers.get("X-SSDA-Cache")));
+
+  delete process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_SERVICE_ROLE_KEY;
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

@@ -171,28 +171,45 @@
         if (!planErr || !planErr.error || planErr.error.code !== 'chunked_conversion_required') {
           throw apiError('/api/audio', base, res, planErr);
         }
-        var planRes = await fetchRetry(audioUrl + '&chunk=info');
-        if (!planRes.ok) {
-          var planErr2 = await planRes.json().catch(function () { return null; });
-          throw apiError('/api/audio', base, planRes, planErr2);
+        // v2.9.0: when the server already has every chunk cached it assembles
+        // the whole file in one shot - try that before fetching chunk by chunk.
+        var allRes = await fetchRetry(audioUrl + '&chunk=all');
+        if (allRes.ok) {
+          var abuf = new Uint8Array(await allRes.arrayBuffer());
+          chunks.push(abuf);
+          loaded += abuf.length;
+          total = loaded;
+          type = allRes.headers.get('Content-Type') || 'audio/mpeg';
+          ext = (allRes.headers.get('X-SSDA-Extension') || '').replace(/\./, '');
+          note = allRes.headers.get('X-SSDA-Format-Note') || '';
+        } else if (allRes.status !== 409) {
+          var allErr = await allRes.json().catch(function () { return null; });
+          throw apiError('/api/audio', base, allRes, allErr);
         }
-        var plan = await planRes.json();
-        var count = plan.chunk_count || 0;
-        for (var ci = 0; ci < count; ci++) {
-          var cres = await fetchRetry(audioUrl + '&chunk=' + ci);
-          if (!cres.ok) {
-            var cErr = await cres.json().catch(function () { return null; });
-            throw apiError('/api/audio', base, cres, cErr);
+        if (!chunks.length) {
+          var planRes = await fetchRetry(audioUrl + '&chunk=info');
+          if (!planRes.ok) {
+            var planErr2 = await planRes.json().catch(function () { return null; });
+            throw apiError('/api/audio', base, planRes, planErr2);
           }
-          if (!type) {
-            type = cres.headers.get('Content-Type') || 'audio/mpeg';
-            ext = (cres.headers.get('X-SSDA-Extension') || '').replace(/\./, '');
-            note = cres.headers.get('X-SSDA-Format-Note') || '';
+          var plan = await planRes.json();
+          var count = plan.chunk_count || 0;
+          for (var ci = 0; ci < count; ci++) {
+            var cres = await fetchRetry(audioUrl + '&chunk=' + ci);
+            if (!cres.ok) {
+              var cErr = await cres.json().catch(function () { return null; });
+              throw apiError('/api/audio', base, cres, cErr);
+            }
+            if (!type) {
+              type = cres.headers.get('Content-Type') || 'audio/mpeg';
+              ext = (cres.headers.get('X-SSDA-Extension') || '').replace(/\./, '');
+              note = cres.headers.get('X-SSDA-Format-Note') || '';
+            }
+            var cbuf = new Uint8Array(await cres.arrayBuffer());
+            chunks.push(cbuf);
+            loaded += cbuf.length;
+            if (opts.onProgress) opts.onProgress(loaded, 0);
           }
-          var cbuf = new Uint8Array(await cres.arrayBuffer());
-          chunks.push(cbuf);
-          loaded += cbuf.length;
-          if (opts.onProgress) opts.onProgress(loaded, 0);
         }
       } else {
         if (!res.ok) {
