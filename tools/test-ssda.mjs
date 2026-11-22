@@ -6,6 +6,9 @@
 // Node loader hooks map the function's `npm:` imports (and .wasm asset
 // imports) onto the local node_modules install, so run `npm install` first.
 import { register } from "node:module";
+import { readFileSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 register("./npm-hook.mjs", import.meta.url);
 
 import { Conversion, Input, Output, BufferTarget, BufferSource, Mp3OutputFormat, Mp4OutputFormat, WaveInputFormat } from "mediabunny";
@@ -68,7 +71,7 @@ const authFixture = {
   kind: "track",
   id: 777,
   title: "Auth Track",
-  duration: 30000,
+  duration: 20000,
   permalink_url: "https://soundcloud.com/test/auth-track",
   track_authorization: "TOKEN123",
   user: { username: "a" },
@@ -84,7 +87,7 @@ const tsFixture = {
   kind: "track",
   id: 333,
   title: "TS Track",
-  duration: 30000,
+  duration: 20000,
   permalink_url: "https://soundcloud.com/test/ts-track",
   user: { username: "t" },
   media: {
@@ -99,7 +102,7 @@ const skipBadFixture = {
   kind: "track",
   id: 444,
   title: "Skip Bad",
-  duration: 30000,
+  duration: 20000,
   permalink_url: "https://soundcloud.com/test/skip-bad",
   user: { username: "s" },
   media: {
@@ -115,7 +118,7 @@ const downloadFixture = {
   kind: "track",
   id: 601,
   title: "Download Track",
-  duration: 30000,
+  duration: 20000,
   permalink_url: "https://soundcloud.com/test/download-track",
   downloadable: true,
   has_downloads_left: 5,
@@ -132,7 +135,7 @@ const drmOnlyFixture = {
   kind: "track",
   id: 602,
   title: "DRM Only",
-  duration: 30000,
+  duration: 20000,
   permalink_url: "https://soundcloud.com/test/drm-only",
   downloadable: false,
   user: { username: "x" },
@@ -148,7 +151,7 @@ const wavFixture = {
   kind: "track",
   id: 603,
   title: "Wav Track",
-  duration: 30000,
+  duration: 20000,
   permalink_url: "https://soundcloud.com/test/wav-track",
   downloadable: true,
   has_downloads_left: 2,
@@ -156,12 +159,72 @@ const wavFixture = {
   media: { transcodings: [] },
 };
 
+// SoundCloud's profile roulette: the same track alternates between a
+// DRM-only rendition profile and a playable one. The first resolve answers
+// with DRM-only transcodings (like the live Harvey probes), the retry with a
+// clear progressive rendition.
+const drmFlakyFixture = {
+  kind: "track",
+  id: 620,
+  title: "DRM Flaky",
+  duration: 20000,
+  permalink_url: "https://soundcloud.com/test/drm-flaky",
+  user: { username: "d" },
+  media: {
+    transcodings: [
+      { url: "https://api-v2.soundcloud.com/media/soundcloud:tracks:620/aaa/stream/cbc-encrypted-hls", format: { protocol: "cbc-encrypted-hls", mime_type: 'audio/mp4; codecs="mp4a.40.2"' }, quality: "sq" },
+      { url: "https://api-v2.soundcloud.com/media/soundcloud:tracks:620/bbb/stream/ctr-encrypted-hls", format: { protocol: "ctr-encrypted-hls", mime_type: 'audio/mp4; codecs="mp4a.40.2"' }, quality: "sq" },
+    ],
+  },
+};
+const drmFlakyFixtureClear = {
+  ...drmFlakyFixture,
+  media: {
+    transcodings: [
+      { url: "https://api-v2.soundcloud.com/media/soundcloud:tracks:620/stream/progressive", format: { protocol: "progressive", mime_type: "audio/mpeg" }, quality: "sq" },
+    ],
+  },
+};
+
+// the api-v2 rendition is broken AND the legacy stream rate-limits (429)
+// before serving: backoff must carry the request through
+const legacy429Fixture = {
+  kind: "track",
+  id: 615,
+  title: "Legacy 429",
+  duration: 20000,
+  permalink_url: "https://soundcloud.com/test/legacy-429",
+  user: { username: "l" },
+  media: {
+    transcodings: [
+      { url: "https://api-v2.soundcloud.com/media/soundcloud:tracks:615/stream/hls/missing615", format: { protocol: "hls", mime_type: "audio/mpegurl" }, quality: "sq" },
+    ],
+  },
+};
+
+// DRM-only profile AND the legacy stream permanently rate-limits (429): the
+// failure is temporary throttling, not a property of the track - the error
+// must say so (502 temporary), not blame DRM or the track.
+const legacy429DrmFixture = {
+  kind: "track",
+  id: 630,
+  title: "Legacy 429 DRM",
+  duration: 20000,
+  permalink_url: "https://soundcloud.com/test/legacy-429-drm",
+  user: { username: "l" },
+  media: {
+    transcodings: [
+      { url: "https://api-v2.soundcloud.com/media/soundcloud:tracks:630/aaa/stream/cbc-encrypted-hls", format: { protocol: "cbc-encrypted-hls", mime_type: 'audio/mp4; codecs="mp4a.40.2"' }, quality: "sq" },
+    ],
+  },
+};
+
 // clear progressive AND DRM AND download -> progressive must win
 const mixedFixture = {
   kind: "track",
   id: 604,
   title: "Mixed Track",
-  duration: 30000,
+  duration: 20000,
   permalink_url: "https://soundcloud.com/test/mixed-track",
   downloadable: true,
   has_downloads_left: 9,
@@ -179,7 +242,7 @@ const oggOnlyFixture = {
   kind: "track",
   id: 555,
   title: "Ogg Only",
-  duration: 30000,
+  duration: 20000,
   permalink_url: "https://soundcloud.com/test/ogg-only",
   user: { username: "o" },
   media: {
@@ -210,7 +273,7 @@ const legacyOnlyFixture = {
   kind: "track",
   id: 610,
   title: "Legacy Only",
-  duration: 30000,
+  duration: 20000,
   permalink_url: "https://soundcloud.com/test/legacy-only",
   downloadable: false,
   user: { username: "l" },
@@ -226,7 +289,7 @@ const legacyFlakyFixture = {
   kind: "track",
   id: 611,
   title: "Legacy Flaky",
-  duration: 30000,
+  duration: 20000,
   permalink_url: "https://soundcloud.com/test/legacy-flaky",
   downloadable: false,
   user: { username: "l" },
@@ -238,7 +301,7 @@ const mediaFlakyFixture = {
   kind: "track",
   id: 612,
   title: "Media Flaky",
-  duration: 30000,
+  duration: 20000,
   permalink_url: "https://soundcloud.com/test/media-flaky",
   user: { username: "m" },
   media: {
@@ -253,7 +316,7 @@ const allDownFixture = {
   kind: "track",
   id: 613,
   title: "All Down",
-  duration: 30000,
+  duration: 20000,
   permalink_url: "https://soundcloud.com/test/all-down",
   downloadable: false,
   user: { username: "a" },
@@ -295,6 +358,10 @@ async function wavToBytes(wav, format, codec, bitrate) {
 
 const realMp3 = await wavToBytes(synthWav(), new Mp3OutputFormat(), "mp3", 128_000);
 const realM4a = await wavToBytes(synthWav(44100), new Mp4OutputFormat(), "aac", 96_000);
+const realMp3Long24 = await wavToBytes(synthWav(22050, 440, 24), new Mp3OutputFormat(), "mp3", 128_000);
+const realM4aLong24 = await wavToBytes(synthWav(44100, 440, 24), new Mp4OutputFormat(), "aac", 96_000);
+const realOggWasm = readFileSync("node_modules/wasm-media-encoders/wasm/ogg.wasm");
+const realMp3Wasm = readFileSync("node_modules/wasm-media-encoders/wasm/mp3.wasm");
 
 // progressive renditions carrying the real bytes; format requests must
 // convert rather than serve the wrong container
@@ -322,6 +389,53 @@ const convAacFixture = {
   media: {
     transcodings: [
       { url: "https://api-v2.soundcloud.com/media/soundcloud:tracks:802/stream/progressive", format: { protocol: "progressive", mime_type: "audio/mp4" }, quality: "sq" },
+    ],
+  },
+};
+
+// long-track chunked conversion: metadata says 213 s, source is a short m4a
+// clip (the chunk machinery is under test). No mp3 rendition -> format=mp3
+// must take the conversion path (the Die Empty case).
+const convLongFixture = {
+  kind: "track",
+  id: 805,
+  title: "Conv Long",
+  duration: 213456,
+  permalink_url: "https://soundcloud.com/test/conv-long",
+  user: { username: "c" },
+  media: {
+    transcodings: [
+      { url: "https://api-v2.soundcloud.com/media/soundcloud:tracks:805/stream/progressive", format: { protocol: "progressive", mime_type: "audio/mp4" }, quality: "sq" },
+    ],
+  },
+};
+
+// 24 s of real audio: chunk windows (10 s) must split + stitch it seamlessly
+const convSpliceFixture = {
+  kind: "track",
+  id: 806,
+  title: "Conv Splice",
+  duration: 24000,
+  permalink_url: "https://soundcloud.com/test/conv-splice",
+  user: { username: "c" },
+  media: {
+    transcodings: [
+      { url: "https://api-v2.soundcloud.com/media/soundcloud:tracks:806/stream/progressive", format: { protocol: "progressive", mime_type: "audio/mp4" }, quality: "sq" },
+    ],
+  },
+};
+
+// 24 s mp3 source: exercises mp3-frame windowing (chunk -> opus)
+const convMp3ChunkFixture = {
+  kind: "track",
+  id: 807,
+  title: "Conv MP3 Chunk",
+  duration: 24000,
+  permalink_url: "https://soundcloud.com/test/conv-mp3chunk",
+  user: { username: "c" },
+  media: {
+    transcodings: [
+      { url: "https://api-v2.soundcloud.com/media/soundcloud:tracks:807/stream/progressive", format: { protocol: "progressive", mime_type: "audio/mpeg" }, quality: "sq" },
     ],
   },
 };
@@ -427,7 +541,10 @@ let flakyCalls = 0;
 let blockedFlakyCalls = 0;
 let legacyFlakyCalls = 0;
 let mediaFlakyCalls = 0;
+let drmFlakyCalls = 0;
+let legacy429Calls = 0;
 let blockMode = false;
+let failCdn = false;
 
 const goodHome = `<html><script src="https://a-v2.sndcdn.com/assets/0-old.js"></script>
   <script crossorigin src="//a-v2.sndcdn.com/assets/99-app.js"></script></html>`;
@@ -439,6 +556,13 @@ globalThis.fetch = async (input, init) => {
   const redirect = (init && init.redirect) || "follow";
   const R = (body, status = 200, headers = {}) => new Response(body, { status, headers });
   const J = (obj, status = 200) => R(JSON.stringify(obj), status, { "Content-Type": "application/json" });
+
+  // npm CDN fallbacks for the codec wasm (serve the right file per name)
+  if (u.includes("cdn.jsdelivr.net/npm/wasm-media-encoders") || u.includes("unpkg.com/wasm-media-encoders")) {
+    if (failCdn) return R("not found", 404);
+    const bytes = u.includes("mp3.wasm") ? realMp3Wasm : realOggWasm;
+    return R(bytes, 200, { "Content-Type": "application/wasm" });
+  }
 
   if (/^https:\/\/(www\.|m\.)?soundcloud\.com\/(discover)?\/?$/.test(u)) {
     homeCalls++;
@@ -467,12 +591,21 @@ globalThis.fetch = async (input, init) => {
     if (target.includes("legacy-flaky")) return J(legacyFlakyFixture);
     if (target.includes("media-flaky")) return J(mediaFlakyFixture);
     if (target.includes("all-down")) return J(allDownFixture);
+    if (target.includes("conv-mp3chunk")) return J(convMp3ChunkFixture);
     if (target.includes("conv-mp3")) return J(convMp3Fixture);
     if (target.includes("conv-aac")) return J(convAacFixture);
+    if (target.includes("conv-long")) return J(convLongFixture);
+    if (target.includes("conv-splice")) return J(convSpliceFixture);
     if (target.includes("shortbad")) return J({ code: "not_a_track", message: "This url is not a track." });
     if (target.includes("junklink")) return J({});
     if (target.includes("download-track")) return J(downloadFixture);
     if (target.includes("drm-only")) return J(drmOnlyFixture);
+    if (target.includes("drm-flaky")) {
+      drmFlakyCalls++;
+      return J(drmFlakyCalls === 1 ? drmFlakyFixture : drmFlakyFixtureClear);
+    }
+    if (target.includes("legacy-429-drm")) return J(legacy429DrmFixture);
+    if (target.includes("legacy-429")) return J(legacy429Fixture);
     if (target.includes("wav-track")) return J(wavFixture);
     if (target.includes("mixed-track")) return J(mixedFixture);
     if (target.includes("auth-track")) return J(authFixture);
@@ -499,6 +632,11 @@ globalThis.fetch = async (input, init) => {
       legacyFlakyCalls++;
       return legacyFlakyCalls === 1 ? R("oops", 503) : R(realMp3, 200, { "Content-Type": "audio/mpeg" });
     }
+    if (id === "615") {
+      legacy429Calls++;
+      return legacy429Calls <= 2 ? R("slow down", 429) : R(realMp3, 200, { "Content-Type": "audio/mpeg" });
+    }
+    if (id === "630") return R("slow down", 429);
     return R("not found", 404);
   }
   // track endpoint used to fetch a fresh track_authorization
@@ -516,6 +654,9 @@ globalThis.fetch = async (input, init) => {
   if (u.includes("/tracks/604/download")) return J({ url: "https://cf-media.sndcdn.com/x4.128.mp3" });
   if (u.includes("soundcloud:tracks:801") && u.includes("/stream/progressive")) return J({ url: "https://cf-media.sndcdn.com/conv/real.mp3" });
   if (u.includes("soundcloud:tracks:802") && u.includes("/stream/progressive")) return J({ url: "https://cf-media.sndcdn.com/conv/real.m4a" });
+  if (u.includes("soundcloud:tracks:805") && u.includes("/stream/progressive")) return J({ url: "https://cf-media.sndcdn.com/conv/real.m4a" });
+  if (u.includes("soundcloud:tracks:806") && u.includes("/stream/progressive")) return J({ url: "https://cf-media.sndcdn.com/conv/real24.m4a" });
+  if (u.includes("soundcloud:tracks:807") && u.includes("/stream/progressive")) return J({ url: "https://cf-media.sndcdn.com/conv/real24.mp3" });
   if (u.includes("soundcloud:tracks:444") && u.includes("/stream/progressive")) return J({ url: "https://cf-media.sndcdn.com/conv/real.mp3" });
   if (u.includes("soundcloud:tracks:612") && u.includes("/stream/progressive")) {
     mediaFlakyCalls++;
@@ -524,6 +665,7 @@ globalThis.fetch = async (input, init) => {
   if (u.includes("soundcloud:tracks:613") && u.includes("/stream/progressive")) return J({ error: "not found" }, 404);
   if (u.includes("/stream/progressive")) return J({ url: "https://cf-media.sndcdn.com/tkHfEWxK.mp3" });
   if (u.includes("/stream/hls/badaac")) return J({ url: "https://cf-hls-media.sndcdn.com/bad/playlist.m3u8" });
+  if (u.includes("/stream/hls/missing615")) return J({ error: "not found" }, 404);
   if (u.includes("/stream/hls/ts")) return J({ url: "https://cf-hls-media.sndcdn.com/ts/playlist.m3u8" });
   if (u.includes("/stream/hls/oggonly")) return J({ url: "https://cf-hls-media.sndcdn.com/opus/playlist.m3u8?token=abc" });
   if (u.includes("/stream/hls/styp")) return J({ url: "https://cf-hls-media.sndcdn.com/styp/playlist.m3u8" });
@@ -535,6 +677,12 @@ globalThis.fetch = async (input, init) => {
   }
   if (u === "https://cf-media.sndcdn.com/conv/real.m4a") {
     return R(realM4a, 200, { "Content-Type": "audio/mp4" });
+  }
+  if (u === "https://cf-media.sndcdn.com/conv/real24.mp3") {
+    return R(realMp3Long24, 200, { "Content-Type": "audio/mpeg" });
+  }
+  if (u === "https://cf-media.sndcdn.com/conv/real24.m4a") {
+    return R(realM4aLong24, 200, { "Content-Type": "audio/mp4" });
   }
   if (u === "https://cf-media.sndcdn.com/tkHfEWxK.mp3" || u === "https://cf-media.sndcdn.com/auth.mp3") {
     return R(new Uint8Array([0x49, 0x44, 0x33, 1, 2, 3]), 200, { "Content-Type": "audio/mpeg", "Content-Length": "6" });
@@ -764,6 +912,33 @@ async function call(path, init) {
   ok(blocked.status === 200 && blocked.headers.get("X-SSDA-Extension") === "mp3", "policy=BLOCK resolve is retried until renditions appear");
 }
 
+// 8b. rendition-profile roulette + legacy rate-limit backoff
+{
+  console.log("profile roulette + 429 backoff:");
+  drmFlakyCalls = 0;
+  const roulette = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/drm-flaky"));
+  ok(roulette.status === 200 && roulette.headers.get("X-SSDA-Extension") === "mp3",
+    "DRM-only profile on resolve is retried until a playable profile appears", String(roulette.status) + " " + roulette.headers.get("X-SSDA-Extension"));
+  ok(drmFlakyCalls >= 2, "resolve was retried past the DRM-only profile", "calls=" + drmFlakyCalls);
+
+  legacy429Calls = 0;
+  const throttled = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/legacy-429"));
+  ok(throttled.status === 200 && throttled.headers.get("X-SSDA-Extension") === "mp3",
+    "legacy stream 429s are backed off and retried", String(throttled.status) + " " + throttled.headers.get("X-SSDA-Extension"));
+  ok(legacy429Calls === 3, "legacy stream served on the third try after two 429s", "calls=" + legacy429Calls);
+}
+
+// 8c. throttled legacy + DRM-only profile -> honest temporary 502
+{
+  console.log("throttled legacy + DRM-only profile:");
+  const res = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/legacy-429-drm"));
+  const body = await res.json();
+  ok(res.status === 502 && body.error.code === "upstream",
+    "legacy 429 + DRM-only profile answers 502 upstream", String(res.status) + " " + JSON.stringify(body.error));
+  ok(/temporary/i.test(body.error.message) && /429/.test(body.error.message),
+    "the message names the rate limit and says it is temporary", body.error.message);
+}
+
 // 9. resilience: challenge page + oEmbed fallback
 {
   console.log("resilience:");
@@ -780,6 +955,36 @@ async function call(path, init) {
   const fbAudio = await call2("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/test-track"));
   ok(fbAudio.status !== 200 && (await fbAudio.json()).error, "audio fails with a clear error when fully blocked");
   blockMode = false;
+}
+
+// 9d. broken ogg.wasm must not poison other conversions (edge-runtime bug)
+{
+  console.log("codec resilience:");
+  const marker = join(tmpdir(), "ssda-fail-ogg-wasm");
+  writeFileSync(marker, "1");
+  try {
+    // wasm import broken AND the CDN fallbacks are down -> clean error,
+    // never an internal file path
+    failCdn = true;
+    const opusFail = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/conv-aac") + "&format=opus");
+    const opusFailBody = (await opusFail.json()).error;
+    ok(opusFail.status === 503 && opusFailBody.code === "codec_unavailable" && !/file:\/\//.test(opusFailBody.message),
+      "opus encoder failure is a clean error", JSON.stringify(opusFailBody));
+
+    // CDN fallback serves the real wasm -> opus conversion works anyway
+    failCdn = false;
+    const opusOk = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/conv-aac") + "&format=opus&x=cdn");
+    ok(opusOk.status === 200 && opusOk.headers.get("X-SSDA-Extension") === "opus",
+      "opus conversion recovers via CDN wasm fallback", String(opusOk.status) + " " + opusOk.headers.get("X-SSDA-Extension"));
+
+    // mp3 conversion works even while ogg.wasm is broken (the Die Empty bug)
+    const mp3Ok = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/conv-aac") + "&format=mp3");
+    ok(mp3Ok.status === 200 && mp3Ok.headers.get("X-SSDA-Extension") === "mp3",
+      "mp3 conversion unaffected by broken ogg.wasm", String(mp3Ok.status));
+  } finally {
+    rmSync(marker, { force: true });
+    failCdn = false;
+  }
 }
 
 // 10. format conversion: decode + re-encode when no matching rendition exists
@@ -877,6 +1082,25 @@ async function call(path, init) {
     "all-sources-down error says it is often transient", JSON.stringify(adErr));
 }
 
+// 10c. edge-runtime regression: the runtime stubs out Worker ("Not implemented:
+// Worker.prototype.constructor"); conversions must not need one
+{
+  console.log("no-Worker conversion (edge runtime):");
+  const realWorker = globalThis.Worker;
+  globalThis.Worker = class {
+    constructor() {
+      throw new Error("Not implemented: Worker.prototype.constructor");
+    }
+  };
+  try {
+    const noWorker = await call("/api/audio?url=" + encodeURIComponent("https://soundcloud.com/test/conv-aac") + "&format=mp3&x=worker");
+    ok(noWorker.status === 200 && noWorker.headers.get("X-SSDA-Extension") === "mp3",
+      "m4a -> mp3 conversion works with Worker stubbed out", String(noWorker.status) + " " + noWorker.headers.get("X-SSDA-Extension"));
+  } finally {
+    globalThis.Worker = realWorker;
+  }
+}
+
 // 11. short-link expansion and resolve-body handling
 {
   console.log("short links:");
@@ -899,6 +1123,96 @@ async function call(path, init) {
   const jb = await j.json();
   ok(j.status === 502 && jb.error && /did not return a track/.test(jb.error.message),
     "junk resolve body -> clear upstream error", JSON.stringify(jb));
+}
+
+// 10. chunked conversion (long tracks exceed the per-request compute budget)
+{
+  console.log("chunked conversion:");
+  const U = encodeURIComponent("https://soundcloud.com/test/conv-long");
+
+  const info = await call("/api/audio?url=" + U + "&format=mp3&chunk=info");
+  const infoB = await info.json();
+  ok(info.status === 200 && infoB.chunk_count === 22 && infoB.chunk_seconds === 10,
+    "chunk=info reports count + window", JSON.stringify(infoB));
+
+  const c0 = await call("/api/audio?url=" + U + "&format=mp3&chunk=0");
+  const c0b = new Uint8Array(await c0.arrayBuffer());
+  ok(c0.status === 200 && c0.headers.get("X-SSDA-Extension") === "mp3", "chunk=0 returns converted mp3",
+    "status=" + c0.status + " body=" + new TextDecoder().decode(c0b.slice(0, 150)));
+  ok(c0.headers.get("X-SSDA-Chunk-Index") === "0" && c0.headers.get("X-SSDA-Chunk-Count") === "22",
+    "chunk index/count headers present");
+  ok(c0b.length > 4 && (c0b[0] === 0xff || (c0b[0] === 0x49 && c0b[1] === 0x44 && c0b[2] === 0x33)),
+    "chunk bytes start with an mp3 frame or ID3", String(c0b.length));
+
+  const cLast = await call("/api/audio?url=" + U + "&format=mp3&chunk=21");
+  ok(cLast.status === 200, "tail chunk past the audio returns 200 (empty is fine to append)",
+    "status=" + cLast.status + " body=" + new TextDecoder().decode(new Uint8Array(await (await call("/api/audio?url=" + U + "&format=mp3&chunk=21")).arrayBuffer()).slice(0, 150)));
+
+  const cBad = await call("/api/audio?url=" + U + "&format=mp3&chunk=22");
+  const cBadB = await cBad.json();
+  ok(cBad.status === 404 && cBadB.error && cBadB.error.code === "invalid_chunk",
+    "out-of-range chunk -> 404 invalid_chunk", JSON.stringify(cBadB));
+
+  const one = await call("/api/audio?url=" + U + "&format=mp3");
+  const oneB = await one.json();
+  ok(one.status === 413 && oneB.error && oneB.error.code === "chunked_conversion_required" && oneB.error.message.includes("chunk=info"),
+    "long single-shot conversion -> 413 with the chunk recipe", JSON.stringify(oneB));
+  ok(!/file:\/\/|\/var\/tmp/.test(oneB.error.message), "413 message leaks no internal paths", oneB.error.message);
+
+  const auto = await call("/api/audio?url=" + U + "&format=auto");
+  ok(auto.status === 200 && auto.headers.get("X-SSDA-Extension") === "m4a",
+    "long track passthrough (auto) unaffected by chunking");
+
+  const m4a = await call("/api/audio?url=" + U + "&format=m4a&chunk=0");
+  const m4aB = await m4a.json();
+  ok(m4a.status === 400 && m4aB.error && m4aB.error.code === "chunking_not_supported_for_format",
+    "m4a chunking refused honestly (cannot be assembled from chunks)", JSON.stringify(m4aB));
+
+  // splice: 24 s of real audio across 3 windows == the single-shot decode
+  const S = encodeURIComponent("https://soundcloud.com/test/conv-splice");
+  const sInfo = await (await call("/api/audio?url=" + S + "&format=mp3&chunk=info")).json();
+  ok(sInfo.chunk_count === 3, "splice fixture plans 3 chunks", JSON.stringify(sInfo));
+
+  const cat = (arrs) => {
+    let n = 0;
+    for (const a of arrs) n += a.length;
+    const out = new Uint8Array(n);
+    let off = 0;
+    for (const a of arrs) { out.set(a, off); off += a.length; }
+    return out;
+  };
+  const parts = [];
+  let allOk = true;
+  for (let i = 0; i < 3; i++) {
+    const r = await call("/api/audio?url=" + S + "&format=mp3&chunk=" + i);
+    parts.push(new Uint8Array(await r.arrayBuffer()));
+    if (r.status !== 200) allOk = false;
+  }
+  ok(allOk, "all splice chunks return 200");
+
+  const whole = await call("/api/audio?url=" + S + "&format=mp3");
+  const wholeB = new Uint8Array(await whole.arrayBuffer());
+  ok(whole.status === 200, "splice fixture single-shot convert ok (24 s < limit)");
+
+  const decodeMp3 = (await import("npm:@audio/decode-mp3@1.3.1")).default;
+  const stitchedPcm = await decodeMp3(cat(parts));
+  const wholePcm = await decodeMp3(wholeB);
+  ok(Math.abs(stitchedPcm.channelData[0].length - wholePcm.channelData[0].length) <= 5 * 1152,
+    "stitched chunks decode to (within encoder padding of) the single-shot length",
+    stitchedPcm.channelData[0].length + " vs " + wholePcm.channelData[0].length);
+  ok(stitchedPcm.channelData[0].length >= 22050 * 23,
+    "stitched audio covers the full 24 s", String(stitchedPcm.channelData[0].length));
+
+  // mp3-source windowing: chunks of a 24 s mp3 converted to opus
+  const P = encodeURIComponent("https://soundcloud.com/test/conv-mp3chunk");
+  const pInfo = await (await call("/api/audio?url=" + P + "&format=opus&chunk=info")).json();
+  ok(pInfo.chunk_count === 3, "mp3-source fixture plans 3 chunks", JSON.stringify(pInfo));
+  const o0 = await call("/api/audio?url=" + P + "&format=opus&chunk=0");
+  const o0b = new Uint8Array(await o0.arrayBuffer());
+  ok(o0.status === 200 && o0.headers.get("X-SSDA-Extension") === "opus" && o0b[0] === 0x4f,
+    "mp3-source chunk converts to opus (OggS)", String(o0.status));
+  const o2 = await call("/api/audio?url=" + P + "&format=opus&chunk=2");
+  ok(o2.status === 200, "mp3-source last chunk ok", String(o2.status));
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

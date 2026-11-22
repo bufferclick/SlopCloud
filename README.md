@@ -76,6 +76,15 @@ Add `&debug=1` to `/api/info` (or `&debug=probe` to `/api/audio`) for diagnostic
   never re-encoded. An explicit `format` prefers that rendition; when the
   track has no file in the requested format, the best available rendition is
   decoded and re-encoded to it (`X-SSDA-Format-Note: converted from ... to ...`).
+- **Long tracks (over ~25 s) that need conversion** are served in chunks —
+  this platform caps per-request compute, so one request cannot convert a
+  whole long track. `&format=mp3` on a long track answers `413
+  chunked_conversion_required` with the recipe: ask `&chunk=info` for the
+  chunk count, then fetch `&chunk=0` .. `&chunk=N-1`. Each response is a
+  valid partial mp3 (or opus) file — concatenate the bodies in order and you
+  have the full song. The SlopCloud site and `slopcloud.js` do this stitching
+  automatically. (`m4a` cannot be assembled from chunks; use mp3/opus for
+  long tracks.)
 - Audio responses carry `X-SSDA-Extension` and a `Content-Disposition` filename
   (`Artist - Title.ext`). When an explicit format is requested and cannot be
   produced, the API returns a clear `415 conversion_failed` error instead of
@@ -145,7 +154,7 @@ browser cache — the browser does the storing, this library does the work.
 | function | what it does |
 | --- | --- |
 | `init()` | open storage; safe to call repeatedly |
-| `fetchAndCache(apiBase, url, opts)` | download a SoundCloud link into the cache; `opts = { format='auto', onProgress(loaded,total), skipIfCached=false }`; returns the song record |
+| `fetchAndCache(apiBase, url, opts)` / `saveToCache(...)` | **the store-to-cache feature** — download a SoundCloud link into the visitor's browser cache; `opts = { format='auto', onProgress(loaded,total), skipIfCached=false }`; returns the song record |
 | `importFile(file)` | store a local audio file in the cache |
 | `listSongs()` | all cached song records, newest first |
 | `getSong(id)` / `getSongBlob(id)` | one record / its audio Blob |

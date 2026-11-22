@@ -154,34 +154,75 @@
         if (existing) return existing;
       }
 
-      var res = await fetchRetry(base + '/api/audio?url=' + encodeURIComponent(soundcloudUrl) + '&format=' + encodeURIComponent(format));
-      if (!res.ok) {
-        var audioErr = await res.json().catch(function () { return null; });
-        throw apiError('/api/audio', base, res, audioErr);
-      }
-
-      var total = Number(res.headers.get('Content-Length')) || 0;
-      var type = res.headers.get('Content-Type') || 'audio/mpeg';
-      var ext = (res.headers.get('X-SSDA-Extension') || '').replace(/^\./, '');
-      if (!ext) ext = { 'audio/mpeg': 'mp3', 'audio/mp4': 'm4a', 'audio/ogg': 'ogg', 'audio/wav': 'wav', 'audio/flac': 'flac' }[type.split(';')[0].trim()] || 'bin';
+      var audioUrl = base + '/api/audio?url=' + encodeURIComponent(soundcloudUrl) + '&format=' + encodeURIComponent(format);
+      var res = await fetchRetry(audioUrl);
 
       var chunks = [];
       var loaded = 0;
-      if (res.body && res.body.getReader) {
-        var reader = res.body.getReader();
-        while (true) {
-          var part = await reader.read();
-          if (part.done) break;
-          chunks.push(part.value);
-          loaded += part.value.length;
-          if (opts.onProgress) opts.onProgress(loaded, total);
+      var total = 0;
+      var type = '';
+      var ext = '';
+      var note = '';
+
+      if (res.status === 413) {
+        // Long track: this platform's per-request compute budget means the
+        // server converts in chunks (&chunk=0..N-1) and we stitch them here.
+        var planErr = await res.json().catch(function () { return null; });
+        if (!planErr || !planErr.error || planErr.error.code !== 'chunked_conversion_required') {
+          throw apiError('/api/audio', base, res, planErr);
+        }
+        var planRes = await fetchRetry(audioUrl + '&chunk=info');
+        if (!planRes.ok) {
+          var planErr2 = await planRes.json().catch(function () { return null; });
+          throw apiError('/api/audio', base, planRes, planErr2);
+        }
+        var plan = await planRes.json();
+        var count = plan.chunk_count || 0;
+        for (var ci = 0; ci < count; ci++) {
+          var cres = await fetchRetry(audioUrl + '&chunk=' + ci);
+          if (!cres.ok) {
+            var cErr = await cres.json().catch(function () { return null; });
+            throw apiError('/api/audio', base, cres, cErr);
+          }
+          if (!type) {
+            type = cres.headers.get('Content-Type') || 'audio/mpeg';
+            ext = (cres.headers.get('X-SSDA-Extension') || '').replace(/\./, '');
+            note = cres.headers.get('X-SSDA-Format-Note') || '';
+          }
+          var cbuf = new Uint8Array(await cres.arrayBuffer());
+          chunks.push(cbuf);
+          loaded += cbuf.length;
+          if (opts.onProgress) opts.onProgress(loaded, 0);
         }
       } else {
-        var buf = await res.arrayBuffer();
-        chunks.push(new Uint8Array(buf));
-        loaded = buf.byteLength;
-        if (opts.onProgress) opts.onProgress(loaded, total);
+        if (!res.ok) {
+          var audioErr = await res.json().catch(function () { return null; });
+          throw apiError('/api/audio', base, res, audioErr);
+        }
+
+        total = Number(res.headers.get('Content-Length')) || 0;
+        type = res.headers.get('Content-Type') || 'audio/mpeg';
+        ext = (res.headers.get('X-SSDA-Extension') || '').replace(/\./, '');
+        note = res.headers.get('X-SSDA-Format-Note') || '';
+
+        if (res.body && res.body.getReader) {
+          var reader = res.body.getReader();
+          while (true) {
+            var part = await reader.read();
+            if (part.done) break;
+            chunks.push(part.value);
+            loaded += part.value.length;
+            if (opts.onProgress) opts.onProgress(loaded, total);
+          }
+        } else {
+          var buf = await res.arrayBuffer();
+          chunks.push(new Uint8Array(buf));
+          loaded = buf.byteLength;
+          if (opts.onProgress) opts.onProgress(loaded, total);
+        }
       }
+
+      if (!ext) ext = { 'audio/mpeg': 'mp3', 'audio/mp4': 'm4a', 'audio/ogg': 'ogg', 'audio/wav': 'wav', 'audio/flac': 'flac' }[type.split(';')[0].trim()] || 'bin';
 
       var blob = new Blob(chunks, { type: type });
       var record = {
@@ -195,7 +236,7 @@
         mime: type.split(';')[0].trim(),
         size: blob.size,
         savedAt: Date.now(),
-        note: res.headers.get('X-SSDA-Format-Note') || '',
+        note: note,
         snip: !!info.snip,
       };
 
@@ -312,6 +353,11 @@
         URL.revokeObjectURL(a.href);
         a.remove();
       }, 4000);
+    },
+
+    /** Alias of fetchAndCache: save a SoundCloud link into the browser cache. */
+    saveToCache: function (apiBase, soundcloudUrl, opts) {
+      return SlopCloud.fetchAndCache(apiBase, soundcloudUrl, opts);
     },
   };
 

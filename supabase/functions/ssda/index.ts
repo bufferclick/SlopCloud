@@ -23,49 +23,226 @@
 // The codec packages (several MB with embedded wasm) are imported lazily on
 // first conversion, so ordinary requests keep a light, fast cold start.
 
-type ConversionCtor = typeof import("npm:mediabunny@1.66.2");
-type Mp3EncMod = typeof import("npm:@mediabunny/mp3-encoder@1.66.2");
-type AacEncMod = typeof import("npm:@mediabunny/aac-encoder@1.66.2");
+// Core codecs: decode-aac/decode-mp3 (FAAD2/mpg123 wasm) and encode-mp3/
+// encode-mp4 (LAME + FDK wasm). All run in-thread - the @mediabunny/*-encoder
+// packages are not used: they encode inside a Web Worker / worker_threads,
+// which the Supabase edge runtime stubs out ("Not implemented:
+// Worker.prototype.constructor"). The opus encoder loads separately: its
+// .wasm import is fragile in some runtimes and must never block mp3/m4a
+// conversions.
 type WmeMod = typeof import("npm:wasm-media-encoders@0.7.0");
+type DecodeAacFn = (typeof import("npm:@audio/decode-aac@1.6.0"))["default"];
+type DecodeMp3Fn = (typeof import("npm:@audio/decode-mp3@1.3.1"))["default"];
+type EncodeM4aFn = (typeof import("npm:@audio/encode-mp4@1.2.1"))["default"];
+type LameMod = typeof import("npm:@breezystack/lamejs@1.2.7");
 
-let codecsPromise: Promise<{
-  mb: ConversionCtor;
-  decodeAac: (b: Uint8Array) => Promise<Pcm>;
-  decodeMp3: (b: Uint8Array) => Promise<Pcm>;
-  Wme: WmeMod["WasmMediaEncoder"];
-  oggWasm: Uint8Array;
-}> | null = null;
+let decodeAacPromise: Promise<DecodeAacFn> | null = null;
+let decodeMp3Promise: Promise<DecodeMp3Fn> | null = null;
+let encodeM4aPromise: Promise<EncodeM4aFn> | null = null;
+let wmePromise: Promise<WmeMod> | null = null;
+let mp3WasmPromise: Promise<Uint8Array> | null = null;
+let lamePromise: Promise<LameMod> | null = null;
+let opusPromise: Promise<{ Wme: WmeMod["WasmMediaEncoder"]; oggWasm: Uint8Array }> | null = null;
 
-function loadCodecs() {
-  codecsPromise ??= (async () => {
-    const [mb, mp3m, aacm, decodeAac, decodeMp3, wme, ogg] = await Promise.all([
-      import("npm:mediabunny@1.66.2"),
-      import("npm:@mediabunny/mp3-encoder@1.66.2"),
-      import("npm:@mediabunny/aac-encoder@1.66.2"),
-      import("npm:@audio/decode-aac@1.6.0"),
-      import("npm:@audio/decode-mp3@1.3.1"),
-      import("npm:wasm-media-encoders@0.7.0"),
-      import("npm:wasm-media-encoders@0.7.0/wasm/ogg.wasm", { with: { type: "bytes" } }),
-    ]);
-    mp3m.registerMp3Encoder();
-    aacm.registerAacEncoder();
-    return {
-      mb,
-      decodeAac: (b: Uint8Array) => (decodeAac as unknown as { default: (x: Uint8Array) => Promise<Pcm> }).default(b),
-      decodeMp3: (b: Uint8Array) => (decodeMp3 as unknown as { default: (x: Uint8Array) => Promise<Pcm> }).default(b),
-      Wme: wme.WasmMediaEncoder,
-      oggWasm: ogg.default as unknown as Uint8Array,
-    };
-  })().catch((err) => {
-    codecsPromise = null; // transient import failure (cold start): allow a retry
+/**
+ * Some runtimes define WebCodecs stubs whose methods throw "Not implemented"
+ * or return promises that never settle (the request then hangs until the
+ * platform kills the worker). The encoder packages prefer WebCodecs and would
+ * die or hang on such a stub. We never need WebCodecs - the wasm paths are
+ * complete - so simply remove any AudioEncoder before loading encoders.
+ */
+function stripBrokenWebCodecs(): void {
+  const g = globalThis as Record<string, unknown>;
+  if (typeof g.AudioEncoder !== "undefined") delete g.AudioEncoder;
+}
+
+// Per-target lazy loaders: a mp3 conversion must never compile the FDK/FLAC
+// wasm graph that encode-mp4 drags in (memory ceiling), and vice versa.
+function loadDecodeAac() {
+  decodeAacPromise ??= import("npm:@audio/decode-aac@1.6.0")
+    .then((m) => m.default)
+    .catch((err) => {
+      decodeAacPromise = null;
+      throw err;
+    });
+  return decodeAacPromise;
+}
+
+function loadDecodeMp3() {
+  decodeMp3Promise ??= import("npm:@audio/decode-mp3@1.3.1")
+    .then((m) => m.default)
+    .catch((err) => {
+      decodeMp3Promise = null;
+      throw err;
+    });
+  return decodeMp3Promise;
+}
+
+function loadWme() {
+  wmePromise ??= import("npm:wasm-media-encoders@0.7.0").catch((err) => {
+    wmePromise = null;
     throw err;
   });
-  return codecsPromise;
+  return wmePromise;
+}
+
+/**
+ * wasm-media-encoders' mp3.wasm/ogg.wasm declare a 2 GB maximum linear
+ * memory. Some edge runtimes count that reservation against the worker's
+ * memory limit and kill the request before a single frame is encoded
+ * (WORKER_RESOURCE_LIMIT). The encoders only need tens of MB, so rewrite the
+ * declared maximum to 64 MB before instantiating.
+ */
+function patchWasmMemoryMax(bytes: Uint8Array, maxPages: number): Uint8Array {
+  const leb = (v: number): number[] => {
+    const out: number[] = [];
+    do {
+      let byte = v & 0x7f;
+      v >>>= 7;
+      if (v) byte |= 0x80;
+      out.push(byte);
+    } while (v);
+    return out;
+  };
+  const parts: Uint8Array[] = [bytes.slice(0, 8)];
+  let p = 8;
+  while (p < bytes.length) {
+    const id = bytes[p];
+    p++;
+    let size = 0;
+    let shift = 0;
+    let b = 0;
+    do {
+      b = bytes[p++];
+      size |= (b & 0x7f) << shift;
+      shift += 7;
+    } while (b & 0x80);
+    const body = bytes.subarray(p, p + size);
+    if (id === 5 && body.length > 2) {
+      // Memory section: rebuild the entry with a smaller max
+      const q: number[] = [body[0]]; // memory count (LEB, single byte in practice)
+      let i = 1;
+      const flags = body[i];
+      q.push(flags);
+      i++;
+      const readLebBytes = (): number[] => {
+        const start = i;
+        let bb = 0;
+        do {
+          bb = body[i++];
+        } while (bb & 0x80);
+        return Array.from(body.subarray(start, i));
+      };
+      q.push(...readLebBytes()); // min
+      if (flags & 1) {
+        readLebBytes(); // drop the old max
+        q.push(...leb(maxPages));
+      }
+      const newBody = Uint8Array.from(q);
+      parts.push(Uint8Array.of(id), Uint8Array.from(leb(newBody.length)), newBody);
+    } else {
+      parts.push(Uint8Array.of(id), Uint8Array.from(leb(size)), body);
+    }
+    p += size;
+  }
+  return concatBytes(parts);
+}
+
+/** wasm bytes: import attribute first, then public npm CDNs; patched memory. */
+async function loadWasmFile(name: "mp3" | "ogg"): Promise<Uint8Array | null> {
+  let bytes: Uint8Array | null = null;
+  try {
+    const m = await import(`npm:wasm-media-encoders@0.7.0/wasm/${name}.wasm`, { with: { type: "bytes" } });
+    const b = (m as { default?: unknown }).default ?? m;
+    if (b instanceof Uint8Array && b.length > 1000) bytes = b;
+  } catch {
+    // some runtimes ignore the bytes attribute and try to parse the wasm as
+    // JS; fall back to fetching the file
+  }
+  if (!bytes) {
+    for (const url of [
+      `https://cdn.jsdelivr.net/npm/wasm-media-encoders@0.7.0/wasm/${name}.wasm`,
+      `https://unpkg.com/wasm-media-encoders@0.7.0/wasm/${name}.wasm`,
+    ]) {
+      try {
+        const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
+        if (res.ok) {
+          const b = new Uint8Array(await res.arrayBuffer());
+          // \0asm magic
+          if (b.length > 1000 && b[0] === 0x00 && b[1] === 0x61 && b[2] === 0x73 && b[3] === 0x6d) {
+            bytes = b;
+            break;
+          }
+        }
+      } catch {
+        // try the next source
+      }
+    }
+  }
+  return bytes ? patchWasmMemoryMax(bytes, 1024) : null; // 64 MB max
+}
+
+function loadMp3Wasm() {
+  mp3WasmPromise ??= (async () => {
+    const b = await loadWasmFile("mp3");
+    if (!b) {
+      throw new ApiError(503, "codec_unavailable", "The mp3 encoder could not be loaded right now. Try format=auto.");
+    }
+    return b;
+  })().catch((err) => {
+    mp3WasmPromise = null;
+    throw err;
+  });
+  return mp3WasmPromise;
+}
+
+/** Pure-JS LAME (no wasm): mp3 encoding must stay wasm-free on this platform. */
+function loadLame() {
+  lamePromise ??= import("npm:@breezystack/lamejs@1.2.7").catch((err) => {
+    lamePromise = null;
+    throw err;
+  });
+  return lamePromise;
+}
+
+function loadEncodeM4a() {
+  encodeM4aPromise ??= (async () => {
+    await stripBrokenWebCodecs();
+    return (await import("npm:@audio/encode-mp4@1.2.1")).default;
+  })().catch((err) => {
+    encodeM4aPromise = null;
+    throw err;
+  });
+  return encodeM4aPromise;
+}
+
+/** ogg.wasm bytes: import attribute first, then public npm CDNs. */
+async function loadOggWasm(): Promise<Uint8Array | null> {
+  return await loadWasmFile("ogg");
+}
+
+function loadOpusEncoder() {
+  opusPromise ??= (async () => {
+    const wme = await import("npm:wasm-media-encoders@0.7.0");
+    const oggWasm = await loadOggWasm();
+    if (!oggWasm) {
+      throw new ApiError(503, "codec_unavailable", "The opus encoder could not be loaded right now. Try format=mp3 or format=auto.");
+    }
+    return { Wme: wme.WasmMediaEncoder, oggWasm };
+  })().catch((err) => {
+    opusPromise = null; // allow a retry on the next request
+    throw err;
+  });
+  return opusPromise;
 }
 
 const SERVICE_NAME = "SSDA";
-const VERSION = "2.7.1";
-const UA =
+const VERSION = "2.8.0";
+// SoundCloud's anti-abuse hard-404s requests that impersonate desktop
+// browsers from datacenter IPs; a plain self-identifying UA passes. Keep a
+// browser-like UA only for fetching SoundCloud's own HTML/JS bundles.
+const UA = "SlopCloud-SSDA/2.7";
+const PAGE_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
 const ALLOWED_HOSTS = new Set([
@@ -77,6 +254,18 @@ const ALLOWED_HOSTS = new Set([
 ]);
 
 const FORMATS = ["auto", "m4a", "mp3", "opus"];
+
+// ---- chunked conversion ----------------------------------------------------
+// This platform caps per-request compute: full-track conversions die with
+// WORKER_RESOURCE_LIMIT (measured: even a 35 s track does not fit). Long
+// tracks are therefore converted in time chunks that clients concatenate:
+// GET ...&format=mp3&chunk=info  -> how many chunks (JSON)
+// GET ...&format=mp3&chunk=N     -> chunk N (valid partial mp3/opus; append
+//                                   them in order to get the full file)
+// Single-request conversion stays available for tracks up to
+// SINGLE_CONVERT_MAX_MS; format=auto is passthrough and never chunked.
+const SINGLE_CONVERT_MAX_MS = 25000;
+const CHUNK_SECONDS = 10;
 
 class ApiError extends Error {
   status: number;
@@ -131,6 +320,15 @@ function serviceIndex() {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/** One clean line, no internal file paths — safe to show API clients. */
+function cleanMessage(msg: string): string {
+  return msg
+    .replace(/file:\/\/\/\S+/g, "an internal file")
+    .replace(/\/var\/tmp\/\S+/g, "an internal file")
+    .split("\n")[0]
+    .slice(0, 160);
 }
 
 function sanitizeFilename(name: string): string {
@@ -267,7 +465,7 @@ function findClientId(text: string): string | null {
 async function scanPageForClientId(page: string): Promise<string | null> {
   const res = await fetch(page, {
     headers: {
-      "User-Agent": UA,
+      "User-Agent": PAGE_UA,
       Accept: "text/html,application/xhtml+xml",
       "Accept-Language": "en-US,en;q=0.9",
     },
@@ -294,7 +492,7 @@ async function scanPageForClientId(page: string): Promise<string | null> {
     const results = await Promise.allSettled(
       batch.map(async (u) => {
         const r = await fetch(u, {
-          headers: { "User-Agent": UA, "Accept-Language": "en-US,en;q=0.9" },
+          headers: { "User-Agent": PAGE_UA, "Accept-Language": "en-US,en;q=0.9" },
           signal: AbortSignal.timeout(15000),
         });
         return r.ok ? await r.text() : "";
@@ -415,7 +613,7 @@ async function resolveTrack(inputUrl: string): Promise<ScTrack> {
   let data: Record<string, unknown> | null = null;
   let lastStatus = 0;
   let lastBodyErr: string | null = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < 4; attempt++) {
     if (attempt > 0) {
       clientIdCache = null;
       await sleep(400 * attempt);
@@ -456,14 +654,21 @@ async function resolveTrack(inputUrl: string): Promise<ScTrack> {
       }
       continue; // maybe a flaky answer; retry before believing it
     }
-    if (body.media?.transcodings?.length) {
+    const list = (body.media?.transcodings ?? []) as Transcoding[];
+    const hasClear = list.some((t) => !isEncrypted(t));
+    if (hasClear) {
       data = body;
       break;
     }
-    data = data ?? body; // keep the (rendition-less) body as fallback
-    if (body.policy === "BLOCK" || body.policy === "SNIP" || body.policy === "WAIT") {
-      continue; // retry: sometimes the next answer has renditions
-    }
+    // Rendition-poor answer: no renditions at all, or only DRM-wrapped ones.
+    // SoundCloud's profile roulette often serves a playable profile on the
+    // next attempt (the same track flips between clear renditions and
+    // DRM-only), so retry before believing it. Keep the richest body seen as
+    // fallback (encrypted renditions still enable the download-file path and
+    // a proper drm_protected error).
+    const prevList = ((data as { media?: { transcodings?: unknown[] } } | null)?.media?.transcodings ?? []) as unknown[];
+    if (!data || list.length > prevList.length) data = body;
+    continue;
   }
 
   if (!data) {
@@ -647,9 +852,10 @@ async function getStreamUrl(transcoding: Transcoding, track?: ScTrack): Promise<
     } else if (res.status !== 401 && res.status !== 403 && res.status !== 404) {
       break; // not a token problem; retrying will not help
     }
-    // token/authorization problem: try to fetch a fresh track_authorization
-    if (track && !ta) {
-      ta = await fetchTrackAuthorization(track);
+    // token/authorization problem: fetch a fresh track_authorization even if
+    // resolve gave us one (they expire and go stale)
+    if (track) {
+      ta = (await fetchTrackAuthorization(track)) ?? ta;
     }
   }
   throw new ApiError(502, "upstream", `Could not get the audio stream URL (HTTP ${lastStatus}).`);
@@ -850,15 +1056,25 @@ interface Rendered {
  * caller can try the next candidate.
  */
 async function renderCandidate(track: ScTrack, cand: Candidate): Promise<Rendered> {
+  if (cand.encrypted) {
+    // Fail fast: DRM-wrapped renditions never play outside a licensed player;
+    // do not even resolve their media URLs.
+    throw new ApiError(
+      415,
+      "drm_protected",
+      `rendition is DRM-encrypted (protocol ${cand.transcoding.format?.protocol || "unknown"})`,
+    );
+  }
   if (cand.legacy) {
     // Legacy public stream endpoint: a plain mp3 redirect, no media URL JSON.
-    // SoundCloud intermittently bot-challenges it, so retry with fresh state.
+    // SoundCloud intermittently bot-challenges or rate-limits it, so retry
+    // with real backoff (the endpoint throttles per IP).
     let bytes: Uint8Array | null = null;
     let lastStatus = 0;
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < 5; attempt++) {
       if (attempt > 0) {
         clientIdCache = null;
-        await sleep(350 * attempt);
+        await sleep(lastStatus === 429 ? 1500 * attempt : 350 * attempt);
       }
       const cid = await getClientId();
       const res = await fetch(`${cand.transcoding.url}?client_id=${cid}`, {
@@ -869,7 +1085,7 @@ async function renderCandidate(track: ScTrack, cand: Candidate): Promise<Rendere
       lastStatus = res.status;
       if (res.ok) {
         const got = new Uint8Array(await res.arrayBuffer());
-        if (containerOf(got) !== "unknown" || attempt === 2) {
+        if (containerOf(got) !== "unknown" || attempt === 4) {
           bytes = got;
           break;
         }
@@ -921,39 +1137,6 @@ async function renderCandidate(track: ScTrack, cand: Candidate): Promise<Rendere
 // Only used for explicit format requests; format=auto is never transcoded.
 
 type Pcm = { channelData: Float32Array[]; sampleRate: number };
-
-function pcmToWav(pcm: Pcm): Uint8Array {
-  const { channelData, sampleRate } = pcm;
-  const n = channelData[0].length;
-  const ch = channelData.length;
-  const data = new Int16Array(n * ch);
-  for (let i = 0; i < n; i++) {
-    for (let c = 0; c < ch; c++) {
-      const v = Math.max(-1, Math.min(1, channelData[c][i]));
-      data[i * ch + c] = Math.round(v * 32767);
-    }
-  }
-  const bytes = new Uint8Array(44 + data.byteLength);
-  const dv = new DataView(bytes.buffer);
-  const w = (o: number, s: string) => {
-    for (let i = 0; i < s.length; i++) bytes[o + i] = s.charCodeAt(i);
-  };
-  w(0, "RIFF");
-  dv.setUint32(4, 36 + data.byteLength, true);
-  w(8, "WAVE");
-  w(12, "fmt ");
-  dv.setUint32(16, 16, true);
-  dv.setUint16(20, 1, true);
-  dv.setUint16(22, ch, true);
-  dv.setUint32(24, sampleRate, true);
-  dv.setUint32(28, sampleRate * 2 * ch, true);
-  dv.setUint16(32, 2 * ch, true);
-  dv.setUint16(34, 16, true);
-  w(36, "data");
-  dv.setUint32(40, data.byteLength, true);
-  bytes.set(new Uint8Array(data.buffer), 44);
-  return bytes;
-}
 
 function wavToPcm(bytes: Uint8Array): Pcm {
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -1151,8 +1334,10 @@ function fmp4ToAdts(bytes: Uint8Array): Uint8Array {
           } else if (box.type === "stbl") {
             const s: { sizes: number[]; chunkOffs: number[]; stscRuns: { firstChunk: number; samplesPerChunk: number }[] } = { sizes: [], chunkOffs: [], stscRuns: [] };
             for (const t of mp4Boxes(bytes, box.start, box.end)) {
-              const dv = new DataView(bytes.buffer, bytes.byteOffset + t.start, 8);
-              if (t.type === "stsz") {
+              const tlen = t.end - t.start;
+              const dv = tlen >= 8 ? new DataView(bytes.buffer, bytes.byteOffset + t.start, tlen) : null;
+              if (!dv) continue;
+              if (t.type === "stsz" && tlen >= 12) {
                 const fixed = dv.getUint32(4);
                 const count = dv.getUint32(8);
                 if (fixed !== 0) {
@@ -1160,7 +1345,7 @@ function fmp4ToAdts(bytes: Uint8Array): Uint8Array {
                 } else {
                   for (let i = 0; i < count; i++) s.sizes.push(new DataView(bytes.buffer, bytes.byteOffset + t.start + 12 + i * 4, 4).getUint32(0));
                 }
-              } else if (t.type === "stco" || t.type === "co64") {
+              } else if ((t.type === "stco" || t.type === "co64") && tlen >= 8) {
                 const count = dv.getUint32(4);
                 for (let i = 0; i < count; i++) {
                   if (t.type === "stco") s.chunkOffs.push(new DataView(bytes.buffer, bytes.byteOffset + t.start + 8 + i * 4, 4).getUint32(0));
@@ -1169,12 +1354,11 @@ function fmp4ToAdts(bytes: Uint8Array): Uint8Array {
                     s.chunkOffs.push(dv2.getUint32(0) * 4294967296 + dv2.getUint32(4));
                   }
                 }
-              } else if (t.type === "stsc") {
+              } else if (t.type === "stsc" && tlen >= 8) {
                 const count = dv.getUint32(4);
                 for (let i = 0; i < count; i++) {
                   const firstChunk = new DataView(bytes.buffer, bytes.byteOffset + t.start + 8 + i * 12, 4).getUint32(0);
                   const samplesPerChunk = new DataView(bytes.buffer, bytes.byteOffset + t.start + 8 + i * 12 + 4, 4).getUint32(0);
-                  s.samplesPerChunk.push(samplesPerChunk);
                   s.stscRuns.push({ firstChunk, samplesPerChunk });
                 }
               }
@@ -1205,28 +1389,100 @@ function fmp4ToAdts(bytes: Uint8Array): Uint8Array {
   return concatBytes(frames);
 }
 
-async function decodeToPcm(bytes: Uint8Array, ext: string): Promise<Pcm> {
-  const codecs = await loadCodecs();
-  if (ext === "mp3") return await codecs.decodeMp3(bytes);
-  if (ext === "m4a" || ext === "aac") {
-    const tryDecode = async (b: Uint8Array): Promise<Pcm | null> => {
-      try {
-        const pcm = await codecs.decodeAac(b);
-        return pcm.channelData.length && pcm.channelData[0]?.length ? pcm : null;
-      } catch {
-        return null;
-      }
-    };
-    // direct decode works for plain ADTS and simple fMP4
-    const direct = await tryDecode(bytes);
-    if (direct) return direct;
-    // styp-headed HLS assemblies and other odd fMP4 need an explicit demux
-    const demuxed = await tryDecode(fmp4ToAdts(bytes));
-    if (demuxed) return demuxed;
-    throw new ApiError(415, "unsupported_container", "decoded audio is empty");
+// ---- streaming conversion plumbing ---------------------------------------
+// The edge worker's memory ceiling is tight: compressed sources are split at
+// codec frame boundaries, decoded one short segment at a time, and fed
+// straight into the encoder. Peak memory stays at one segment of PCM plus the
+// encoder's wasm heap instead of the whole track.
+
+const SEGMENT_TARGET = 120000; // compressed bytes per segment (~6-10 s)
+
+function groupSegments(frames: Uint8Array[]): Uint8Array[] {
+  const segs: Uint8Array[] = [];
+  let cur: Uint8Array[] = [];
+  let size = 0;
+  for (const f of frames) {
+    cur.push(f);
+    size += f.length;
+    if (size >= SEGMENT_TARGET) {
+      segs.push(concatBytes(cur));
+      cur = [];
+      size = 0;
+    }
   }
-  if (ext === "wav") return wavToPcm(bytes);
-  throw new ApiError(415, "unsupported_container", `cannot convert audio from '${ext}'`);
+  if (cur.length) segs.push(concatBytes(cur));
+  return segs;
+}
+
+function splitAdtsFrames(bytes: Uint8Array): Uint8Array[] {
+  const frames: Uint8Array[] = [];
+  let i = 0;
+  while (i + 7 <= bytes.length) {
+    if (bytes[i] === 0xff && (bytes[i + 1] & 0xf0) === 0xf0) {
+      const len = ((bytes[i + 3] & 0x03) << 11) | (bytes[i + 4] << 3) | ((bytes[i + 5] & 0xe0) >> 5);
+      if (len >= 7 && i + len <= bytes.length) {
+        frames.push(bytes.subarray(i, i + len));
+        i += len;
+        continue;
+      }
+    }
+    i++;
+  }
+  return frames;
+}
+
+function splitMp3Frames(bytes: Uint8Array): Uint8Array[] {
+  const BITR1 = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0];
+  const BITR2 = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0];
+  const RATES: Record<number, number[]> = {
+    3: [44100, 48000, 32000], // MPEG-1
+    2: [22050, 24000, 16000], // MPEG-2
+    0: [11025, 12000, 8000], // MPEG-2.5
+  };
+  let start = 0;
+  if (bytes.length > 10 && ascii(bytes, 0, 3) === "ID3") {
+    start = 10 + (((bytes[6] & 0x7f) << 21) | ((bytes[7] & 0x7f) << 14) | ((bytes[8] & 0x7f) << 7) | (bytes[9] & 0x7f));
+  }
+  const frames: Uint8Array[] = [];
+  let i = start;
+  while (i + 4 <= bytes.length) {
+    if (bytes[i] === 0xff && (bytes[i + 1] & 0xe0) === 0xe0) {
+      const ver = (bytes[i + 1] >> 3) & 0x03;
+      const layer = (bytes[i + 1] >> 1) & 0x03;
+      const bi = (bytes[i + 2] >> 4) & 0x0f;
+      const sfi = (bytes[i + 2] >> 2) & 0x03;
+      const table = ver === 3 ? BITR1 : BITR2;
+      if (ver !== 1 && layer === 1 && sfi !== 3 && bi !== 0 && bi !== 15 && RATES[ver]) {
+        const br = table[bi] * 1000;
+        const rate = RATES[ver][sfi];
+        const pad = (bytes[i + 2] >> 1) & 0x01;
+        const len = Math.floor((ver === 3 ? 144 : 72) * br / rate) + pad;
+        if (len >= 4 && i + len <= bytes.length) {
+          frames.push(bytes.subarray(i, i + len));
+          i += len;
+          continue;
+        }
+      }
+    }
+    i++;
+  }
+  return frames;
+}
+
+async function decodeSegment(seg: Uint8Array, srcExt: string): Promise<Pcm> {
+  if (srcExt === "mp3") return await (await loadDecodeMp3())(seg);
+  if (srcExt === "m4a" || srcExt === "aac") return await (await loadDecodeAac())(seg);
+  if (srcExt === "wav") return wavToPcm(seg);
+  throw new ApiError(415, "unsupported_container", `cannot convert audio from '${srcExt}'`);
+}
+
+function floatTo16(ch: Float32Array, from: number, to: number): Int16Array {
+  const out = new Int16Array(to - from);
+  for (let i = from; i < to; i++) {
+    const s = Math.max(-1, Math.min(1, ch[i]));
+    out[i - from] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return out;
 }
 
 function resample(ch: Float32Array, from: number, to: number): Float32Array {
@@ -1243,76 +1499,295 @@ function resample(ch: Float32Array, from: number, to: number): Float32Array {
   return out;
 }
 
-async function encodeOpus(pcm: Pcm): Promise<Uint8Array> {
-  const codecs = await loadCodecs();
-  const OPUS_RATES = [8000, 12000, 16000, 24000, 48000];
-  const rate = OPUS_RATES.includes(pcm.sampleRate) ? pcm.sampleRate : 48000;
-  const channels = pcm.channelData.length >= 2 ? 2 : 1;
-  const chs = pcm.channelData.slice(0, channels).map((c) => resample(c, pcm.sampleRate, rate));
-  const enc = await codecs.Wme.create("audio/ogg", codecs.oggWasm);
-  enc.configure({ channels: channels as 1 | 2, sampleRate: rate, vbrQuality: 8 });
+type Sink = {
+  ext: string;
+  mime: string;
+  container: string;
+  push(pcm: Pcm): Promise<void>;
+  finish(): Promise<Uint8Array>;
+};
+
+async function makeSink(fmt: string, first: Pcm): Promise<Sink> {
+  const channels = Math.min(2, first.channelData.length);
+  const sampleRate = first.sampleRate;
   const parts: Uint8Array[] = [];
+  const take = (b: Uint8Array | undefined | null) => {
+    if (b && b.length) parts.push(b);
+  };
+
+  if (fmt === "mp3") {
+    // Pure-JS LAME encoder. The wasm encoder modules (wasm-media-encoders,
+    // @audio/encode-mp3) get this platform's worker killed with
+    // WORKER_RESOURCE_LIMIT before a frame is out, even with a patched memory
+    // maximum - so mp3 encoding stays wasm-free.
+    const lame = await loadLame();
+    const enc = new lame.Mp3Encoder(channels, sampleRate, 320);
+    return {
+      ext: "mp3", mime: "audio/mpeg", container: "mp3",
+      async push(pcm: Pcm) {
+        const CHUNK = 8192;
+        const n = pcm.channelData[0].length;
+        for (let off = 0; off < n; off += CHUNK) {
+          const end = Math.min(off + CHUNK, n);
+          const l = floatTo16(pcm.channelData[0], off, end);
+          take(channels === 2 ? enc.encodeBuffer(l, floatTo16(pcm.channelData[1], off, end)) : enc.encodeBuffer(l));
+        }
+      },
+      async finish() {
+        take(enc.flush());
+        return concatBytes(parts);
+      },
+    };
+  }
+
+  if (fmt === "m4a") {
+    const enc = await (await loadEncodeM4a())({ sampleRate, channels, codec: "aac", profile: "lc", bitrate: 256 });
+    return {
+      ext: "m4a", mime: "audio/mp4", container: "fmp4",
+      async push(pcm: Pcm) {
+        const CHUNK = 8192;
+        const n = pcm.channelData[0].length;
+        for (let off = 0; off < n; off += CHUNK) {
+          await enc.encode(pcm.channelData.slice(0, channels).map((c) => c.subarray(off, Math.min(off + CHUNK, n))));
+        }
+      },
+      async finish() {
+        take(await enc.flush()); // whole-file mode: the complete m4a
+        enc.free();
+        return concatBytes(parts);
+      },
+    };
+  }
+
+  // opus
+  const { Wme, oggWasm } = await loadOpusEncoder();
+  const OPUS_RATES = [8000, 12000, 16000, 24000, 48000];
+  const rate = OPUS_RATES.includes(sampleRate) ? sampleRate : 48000;
+  const enc = await Wme.create("audio/ogg", oggWasm);
+  enc.configure({ channels: channels as 1 | 2, sampleRate: rate, vbrQuality: 8 });
   const frame = Math.round(rate * 0.02); // 20 ms frames
-  for (let off = 0; off < chs[0].length; off += frame) {
-    const chunk = chs.map((c) => c.subarray(off, Math.min(off + frame, c.length)));
-    if (chunk[0].length === 0) break;
-    const b = enc.encode(chunk);
-    if (b.length) parts.push(b);
-  }
-  const fin = enc.finalize();
-  if (fin.length) parts.push(fin);
-  const total = parts.reduce((a, b) => a + b.length, 0);
-  const bytes = new Uint8Array(total);
-  let o = 0;
-  for (const p of parts) {
-    bytes.set(p, o);
-    o += p.length;
-  }
-  return bytes;
+  const bufs: Float32Array[] = [];
+  for (let i = 0; i < channels; i++) bufs.push(new Float32Array(0));
+  const drain = (all: boolean) => {
+    const n = bufs[0].length;
+    const whole = all ? n : Math.floor(n / frame) * frame;
+    if (whole > 0) take(enc.encode(bufs.map((b) => b.subarray(0, whole))));
+    for (let i = 0; i < channels; i++) bufs[i] = bufs[i].slice(whole);
+  };
+  return {
+    ext: "opus", mime: "audio/ogg", container: "ogg",
+    async push(pcm: Pcm) {
+      const chs = pcm.channelData.slice(0, channels).map((c) => resample(c, pcm.sampleRate, rate));
+      for (let i = 0; i < channels; i++) {
+        const joined = new Float32Array(bufs[i].length + chs[i].length);
+        joined.set(bufs[i], 0);
+        joined.set(chs[i], bufs[i].length);
+        bufs[i] = joined;
+      }
+      drain(false);
+    },
+    async finish() {
+      drain(true);
+      take(enc.finalize());
+      return concatBytes(parts);
+    },
+  };
 }
 
 async function convertAudio(bytes: Uint8Array, srcExt: string, fmt: string): Promise<Rendered> {
-  let codecs: Awaited<ReturnType<typeof loadCodecs>>;
+  // Split the compressed source at frame boundaries and process segment by
+  // segment so the whole track never sits in memory as PCM.
+  let segments: Uint8Array[] | null = null;  if (srcExt === "m4a" || srcExt === "aac") {
+    try {
+      const adts = srcExt === "aac" ? bytes : fmp4ToAdts(bytes);
+      const frames = splitAdtsFrames(adts);
+      if (frames.length) segments = groupSegments(frames);
+    } catch {
+      // ALAC and layouts the demuxer cannot read: decode-aac handles the
+      // whole file itself as one segment
+      segments = null;
+    }
+  } else if (srcExt === "mp3") {
+    const frames = splitMp3Frames(bytes);
+    if (frames.length) segments = groupSegments(frames);
+  }
+  segments ??= [bytes];
+
+  let sink: Sink | null = null;
+  for (const seg of segments) {
+    const pcm = await decodeSegment(seg, srcExt);
+    if (!pcm.channelData.length || !pcm.channelData[0]?.length) continue;
+    if (!sink) sink = await makeSink(fmt, pcm);
+    await sink.push(pcm);
+  }
+  if (!sink) throw new ApiError(415, "unsupported_container", "decoded audio is empty");
+  const outBytes = await sink.finish();
+  return { bytes: outBytes, ext: sink.ext, mime: sink.mime, container: sink.container };
+}
+
+/**
+ * Compressed-frame windowing for chunked conversion: keep only the codec
+ * frames covering [fromSec, toSec). Frame positions are computed from the
+ * codec's samples-per-frame, so chunk boundaries are exact and seamless.
+ */
+function windowFrames(bytes: Uint8Array, srcExt: string, fromSec: number, toSec: number): Uint8Array {
+  type Fr = { start: number; end: number; samples: number };
+  let frames: Fr[] = [];
+  let sampleRate = 44100;
+  if (srcExt === "mp3") {
+    const RATES: Record<number, number[]> = {
+      3: [44100, 48000, 32000],
+      2: [22050, 24000, 16000],
+      0: [11025, 12000, 8000],
+    };
+    let offset = 0;
+    if (bytes.length > 10 && ascii(bytes, 0, 3) === "ID3") {
+      offset = 10 + (((bytes[6] & 0x7f) << 21) | ((bytes[7] & 0x7f) << 14) | ((bytes[8] & 0x7f) << 7) | (bytes[9] & 0x7f));
+    }
+    const parts = splitMp3Frames(bytes);
+    for (const f of parts) {
+      const ver = (f[1] >> 3) & 0x03;
+      const sfi = (f[2] >> 2) & 0x03;
+      const samples = ver === 3 ? 1152 : 576;
+      if (RATES[ver] && sfi !== 3) sampleRate = RATES[ver][sfi];
+      frames.push({ start: f.byteOffset - bytes.byteOffset, end: f.byteOffset - bytes.byteOffset + f.length, samples });
+    }
+    void offset;
+  } else {
+    const adts = srcExt === "aac" ? bytes : fmp4ToAdts(bytes);
+    const sfi = adts.length > 2 ? (adts[2] >> 2) & 0x0f : 4;
+    const SR = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
+    if (sfi < SR.length) sampleRate = SR[sfi];
+    const parts = splitAdtsFrames(adts);
+    for (const f of parts) {
+      frames.push({ start: f.byteOffset - adts.byteOffset, end: f.byteOffset - adts.byteOffset + f.length, samples: 1024 });
+    }
+    // re-base onto `bytes` when we demuxed from an fMP4 container
+    if (srcExt !== "aac") {
+      return windowFrames(frames.length ? concatBytes(frames.map((f) => adts.subarray(f.start, f.end))) : new Uint8Array(0), "aac", fromSec, toSec);
+    }
+  }
+  const s0 = Math.round(fromSec * sampleRate);
+  const s1 = Math.round(toSec * sampleRate);
+  let at = 0;
+  const keep: Uint8Array[] = [];
+  for (const f of frames) {
+    const end = at + f.samples;
+    if (end > s0 && at < s1) keep.push(bytes.subarray(f.start, f.end));
+    at = end;
+  }
+  return concatBytes(keep);
+}
+
+/**
+ * Serve one conversion chunk (or the chunk plan for chunk=info). Chunk
+ * requests convert at most one ~CHUNK_SECONDS window of audio, staying well
+ * inside the per-request compute budget.
+ */
+async function serveChunk(track: ScTrack, meta: ReturnType<typeof trackMeta>, cand: Candidate, fmt: string, sel: number | "info"): Promise<Response> {
+  if (fmt === "m4a") {
+    throw new ApiError(
+      400,
+      "chunking_not_supported_for_format",
+      "m4a files cannot be assembled from chunks. Use format=mp3 (or format=opus) for long tracks, or a track shorter than 25 s.",
+    );
+  }
+  const streamUrl = await getStreamUrl(cand.transcoding, track);
+  const proto = cand.transcoding.format?.protocol || "";
+  const isDirect = cand.legacy ||
+    cand.transcoding.url.includes("/stream/progressive") ||
+    proto === "progressive" || proto === "download";
+
+  let count = 0;
+  let window: Uint8Array = new Uint8Array(0);
+  let srcExt = "mp3";
+
+  if (isDirect) {
+    const durSec = (track.duration ?? 0) / 1000;
+    count = Math.max(1, Math.ceil(durSec / CHUNK_SECONDS));
+    if (sel === "info") {
+      return jsonResponse({ chunk_count: count, chunk_seconds: CHUNK_SECONDS, format: fmt });
+    }
+    if (!(sel >= 0) || sel >= count) {
+      throw new ApiError(404, "invalid_chunk", `chunk must be between 0 and ${count - 1} (or 'info').`);
+    }
+    const bytes = await fetchBytes(streamUrl, 2);
+    const container = containerOf(bytes);
+    if (container === "mp3") srcExt = "mp3";
+    else if (container === "fmp4") srcExt = "m4a";
+    else if (container === "ts") {
+      const adts = tsToAdts(bytes);
+      if (!adts) throw new ApiError(415, "unsupported_container", "stream has no AAC frames");
+      window = windowFrames(adts, "aac", sel * CHUNK_SECONDS, (sel + 1) * CHUNK_SECONDS);
+    } else {
+      throw new ApiError(415, "unsupported_container", `cannot convert audio from '${container}'`);
+    }
+    if (container !== "ts") {
+      window = windowFrames(bytes, srcExt, sel * CHUNK_SECONDS, (sel + 1) * CHUNK_SECONDS);
+    }
+    srcExt = container === "ts" ? "aac" : srcExt;
+  } else {
+    // HLS: fetch only this chunk's segments (plus the init segment).
+    const head = await fetch(streamUrl, { headers: { "User-Agent": UA }, signal: AbortSignal.timeout(20000) });
+    if (!head.ok) throw new ApiError(502, "upstream", `HLS playlist fetch failed (HTTP ${head.status}).`);
+    let text = await head.text();
+    let baseUrl = streamUrl;
+    if (isMasterPlaylist(text)) {
+      const variant = firstVariant(text, streamUrl);
+      if (!variant) throw new ApiError(502, "upstream", "HLS master playlist has no variants.");
+      const vres = await fetch(variant, { headers: { "User-Agent": UA }, signal: AbortSignal.timeout(20000) });
+      if (!vres.ok) throw new ApiError(502, "upstream", `HLS variant fetch failed (HTTP ${vres.status}).`);
+      text = await vres.text();
+      baseUrl = variant;
+    }
+    const { init, segments, key } = parseMediaPlaylist(text, baseUrl);
+    if (key) throw new ApiError(415, "drm_protected", `rendition is DRM-encrypted (${key.slice(0, 80)})`);
+    if (!segments.length) throw new ApiError(502, "upstream", "HLS playlist has no segments.");
+    count = segments.length;
+    if (sel === "info") {
+      return jsonResponse({ chunk_count: count, chunk_seconds: 0, format: fmt });
+    }
+    if (!(sel >= 0) || sel >= count) {
+      throw new ApiError(404, "invalid_chunk", `chunk must be between 0 and ${count - 1} (or 'info').`);
+    }
+    const urls = (init ? [init] : []).concat([segments[sel]]);
+    const got = await Promise.all(urls.map((u) => fetchBytes(u)));
+    const raw = concatBytes(got);
+    const container = containerOf(raw);
+    if (container === "ts") {
+      const adts = tsToAdts(raw);
+      if (!adts) throw new ApiError(415, "unsupported_container", "stream has no AAC frames");
+      window = adts;
+      srcExt = "aac";
+    } else if (container === "fmp4") {
+      window = raw;
+      srcExt = "m4a";
+    } else if (container === "ogg") {
+      throw new ApiError(415, "conversion_failed", "this track's source is opus and cannot be converted to " + fmt);
+    } else {
+      throw new ApiError(415, "unsupported_container", `rendition container '${container}' cannot be converted`);
+    }
+  }
+
+  let out: Rendered;
   try {
-    codecs = await loadCodecs();
-  } catch {
-    codecs = await loadCodecs(); // transient import failure (cold start): retry once
+    // windowFrames already demuxed m4a/aac sources down to raw ADTS frames
+    out = await convertAudio(window, srcExt === "mp3" ? "mp3" : "aac", fmt);
+  } catch (err) {
+    if (window.length === 0) {
+      // chunk past the end of the audio: an empty tail is fine to concatenate
+      const m = fmt === "mp3" ? { ext: "mp3", mime: "audio/mpeg" } : { ext: "opus", mime: "audio/ogg" };
+      out = { bytes: new Uint8Array(0), ...m, container: m.ext };
+    } else if (err instanceof ApiError) {
+      throw err;
+    } else {
+      throw new ApiError(415, "conversion_failed", cleanMessage(err instanceof Error ? err.message : String(err)));
+    }
   }
-  const pcm = await decodeToPcm(bytes, srcExt);
-  if (!pcm.channelData.length || !pcm.channelData[0]?.length) {
-    throw new ApiError(415, "unsupported_container", "decoded audio is empty");
-  }
-  if (fmt === "opus") {
-    const ogg = await encodeOpus(pcm);
-    return { bytes: ogg, ext: "opus", mime: "audio/ogg", container: "ogg" };
-  }
-  const { Conversion, Input, Output, BufferTarget, BufferSource, Mp3OutputFormat, Mp4OutputFormat, WaveInputFormat } = codecs.mb;
-  const wav = pcmToWav(pcm);
-  const input = new Input({
-    source: new BufferSource(wav),
-    formats: [new WaveInputFormat()],
-  });
-  const target = new BufferTarget();
-  const output = new Output({
-    format: fmt === "mp3" ? new Mp3OutputFormat() : new Mp4OutputFormat(),
-    target,
-  });
-  const conversion = await Conversion.init({
-    input,
-    output,
-    audio: {
-      codec: fmt === "mp3" ? "mp3" : "aac",
-      bitrate: fmt === "mp3" ? 320_000 : 256_000,
-      forceTranscode: true,
-    },
-  });
-  await conversion.execute();
-  return {
-    bytes: new Uint8Array(target.buffer as ArrayBuffer),
-    ext: fmt === "mp3" ? "mp3" : "m4a",
-    mime: fmt === "mp3" ? "audio/mpeg" : "audio/mp4",
-    container: fmt === "mp3" ? "mp3" : "fmp4",
-  };
+  const h = audioHeaders(meta, out.ext, out.mime, `converted chunk ${sel}/${count}`, false, out.bytes.length);
+  h.set("X-SSDA-Chunk-Index", String(sel));
+  h.set("X-SSDA-Chunk-Count", String(count));
+  return new Response(out.bytes, { status: 200, headers: h });
 }
 
 /**
@@ -1321,16 +1796,16 @@ async function convertAudio(bytes: Uint8Array, srcExt: string, fmt: string): Pro
  * once (legacy stream + media URLs together); a fresh pass with a new
  * client_id usually recovers within a second or two.
  */
-async function serveAudio(url: string, fmt: string, attachment: boolean): Promise<Response> {
+async function serveAudio(url: string, fmt: string, attachment: boolean, chunkSel: number | "info" | null): Promise<Response> {
   try {
-    return await serveAudioPass(url, fmt, attachment);
+    return await serveAudioPass(url, fmt, attachment, chunkSel);
   } catch (err) {
     const transient = err instanceof ApiError && err.code === "upstream" && err.status === 502;
     if (!transient) throw err;
     clientIdCache = null;
     await sleep(700);
     try {
-      return await serveAudioPass(url, fmt, attachment);
+      return await serveAudioPass(url, fmt, attachment, chunkSel);
     } catch (err2) {
       if (err2 instanceof ApiError && err2.code === "upstream" && err2.status === 502) {
         throw new ApiError(502, "upstream", `${err2.message} This is often transient - try again in a few seconds.`);
@@ -1340,12 +1815,33 @@ async function serveAudio(url: string, fmt: string, attachment: boolean): Promis
   }
 }
 
-async function serveAudioPass(url: string, fmt: string, attachment: boolean): Promise<Response> {
+async function serveAudioPass(url: string, fmt: string, attachment: boolean, chunkSel: number | "info" | null): Promise<Response> {
   const track = await resolveTrack(url);
   const meta = trackMeta(track, url);
   const candidates = buildCandidates(track, fmt);
+
+  // Chunked conversion: serve the chunk plan or exactly one chunk window.
+  if (chunkSel !== null && fmt !== "auto") {
+    let lastErr: ApiError | null = null;
+    for (const cand of candidates) {
+      if (cand.encrypted) break;
+      try {
+        return await serveChunk(track, meta, cand, fmt, chunkSel);
+      } catch (err) {
+        if (err instanceof ApiError && (err.code === "invalid_chunk" || err.code === "chunking_not_supported_for_format")) throw err;
+        if (err instanceof ApiError) {
+          lastErr = err;
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw lastErr ?? new ApiError(403, "not_streamable", "No usable audio rendition found for this track.");
+  }
+
   let lastErr: ApiError | null = null;
   let source: Rendered | null = null;
+  let legacyStatus = 0;
 
   for (const cand of candidates) {
     try {
@@ -1364,6 +1860,9 @@ async function serveAudioPass(url: string, fmt: string, attachment: boolean): Pr
         });
       }
     } catch (err) {
+      if (cand.legacy && err instanceof ApiError) {
+        legacyStatus = Number((err.message.match(/HTTP (\d+)/) ?? [])[1] ?? 0);
+      }
       if (err instanceof ApiError && (err.code === "unsupported_container" || err.code === "upstream" || err.code === "drm_protected")) {
         lastErr = err;
         continue; // try the next rendition
@@ -1374,6 +1873,18 @@ async function serveAudioPass(url: string, fmt: string, attachment: boolean): Pr
 
   // No rendition in the requested format: convert the best one we could render.
   if (fmt !== "auto" && source) {
+    const durMs = track.duration ?? 0;
+    if (durMs > SINGLE_CONVERT_MAX_MS) {
+      // Converting the whole track in one request exceeds this platform's
+      // per-request compute budget. Serve the honest chunked recipe instead.
+      throw new ApiError(
+        413,
+        "chunked_conversion_required",
+        `Converting a ${Math.round(durMs / 1000)} s track to ${fmt} in one request exceeds this platform's compute budget. ` +
+        `Request the audio in chunks instead: add &chunk=info for the chunk count, then fetch &chunk=0 .. &chunk=N-1 ` +
+        `(each response is a valid partial ${fmt === "m4a" ? "mp3" : fmt} file) and concatenate them in order.`,
+      );
+    }
     try {
       const out = await convertAudio(source.bytes, source.ext, fmt);
       return new Response(out.bytes, {
@@ -1381,8 +1892,10 @@ async function serveAudioPass(url: string, fmt: string, attachment: boolean): Pr
         headers: audioHeaders(meta, out.ext, out.mime, `converted from ${source.ext} to ${out.ext}`, attachment, out.bytes.length),
       });
     } catch (err) {
-      // Never silently hand back the wrong format when one was requested.
-      const why = err instanceof ApiError || err instanceof Error ? err.message : String(err);
+      if (err instanceof ApiError && err.code === "codec_unavailable") throw err;
+      // Never silently hand back the wrong format when one was requested,
+      // and never leak internal paths/stacks to API clients.
+      const why = cleanMessage(err instanceof Error ? err.message : String(err));
       throw new ApiError(
         415,
         "conversion_failed",
@@ -1391,6 +1904,16 @@ async function serveAudioPass(url: string, fmt: string, attachment: boolean): Pr
     }
   }
 
+  if (legacyStatus === 429) {
+    // The free stream endpoint is throttling this datacenter right now. That
+    // is temporary by nature; say so honestly instead of blaming the track.
+    const drmOnly = (track.media?.transcodings ?? []).every((t) => isEncrypted(t));
+    throw new ApiError(
+      502,
+      "upstream",
+      `SoundCloud's free stream endpoint is rate-limiting us right now (HTTP 429)${drmOnly ? " and this track's other renditions are DRM-protected" : ""}. This is usually temporary - try again in a minute or two.`,
+    );
+  }
   if (lastErr?.code === "drm_protected") {
     throw new ApiError(
       415,
@@ -1412,7 +1935,112 @@ async function serveAudioPass(url: string, fmt: string, attachment: boolean): Pr
     new ApiError(403, "not_streamable", "No usable audio rendition found for this track.");
 }
 
+
 // ---------------------------------------------------------------- diagnostics
+
+/**
+ * GET /api/audio?...&debug=stage&step=wasm|decode|combo|convert -> run one
+ * conversion stage in isolation and report timing/size. Each stage is a
+ * separate worker run so a resource kill pinpoints the exact step.
+ */
+async function runStage(link: string, step: string): Promise<Response> {
+  const t0 = Date.now();
+  const at = (label: string, extra: Record<string, unknown> = {}) => ({ step, label, ms: Date.now() - t0, ...extra });
+  try {
+    if (step === "wasm") {
+      const wme = await loadWme();
+      const wasm = await loadMp3Wasm();
+      const enc = await wme.WasmMediaEncoder.create("audio/mpeg", wasm);
+      enc.configure({ channels: 2, sampleRate: 44100, bitrate: 320 });
+      const n = 44100;
+      const sine = new Float32Array(n);
+      for (let i = 0; i < n; i++) sine[i] = Math.sin(2 * Math.PI * 440 * i / 44100) * 0.3;
+      let size = 0;
+      for (let off = 0; off < n; off += 8192) {
+        const chunk = sine.subarray(off, Math.min(off + 8192, n));
+        size += enc.encode([chunk, chunk]).length;
+      }
+      size += enc.finalize().length;
+      enc.free?.();
+      return jsonResponse(at("done", { wasm: wasm.length, mp3: size }));
+    }
+    if (step === "wasmogg") {
+      const { Wme, oggWasm } = await loadOpusEncoder();
+      const enc = await Wme.create("audio/ogg", oggWasm);
+      enc.configure({ channels: 2, sampleRate: 48000, vbrQuality: 8 });
+      const n = 48000;
+      const sine = new Float32Array(n);
+      for (let i = 0; i < n; i++) sine[i] = Math.sin(2 * Math.PI * 440 * i / 48000) * 0.3;
+      let size = 0;
+      for (let off = 0; off < n; off += 960) {
+        const chunk = sine.subarray(off, Math.min(off + 960, n));
+        size += enc.encode([chunk, chunk]).length;
+      }
+      size += enc.finalize().length;
+      enc.free?.();
+      return jsonResponse(at("done", { oggWasm: oggWasm.length, out: size }));
+    }
+    if (step === "lame") {
+      const lame = await loadLame();
+      const enc = new lame.Mp3Encoder(2, 44100, 320);
+      const n = 44100;
+      const sine = new Int16Array(n);
+      for (let i = 0; i < n; i++) sine[i] = Math.sin(2 * Math.PI * 440 * i / 44100) * 12000;
+      let size = 0;
+      for (let off = 0; off < n; off += 8192) {
+        size += enc.encodeBuffer(sine.subarray(off, Math.min(off + 8192, n)), sine.subarray(off, Math.min(off + 8192, n))).length;
+      }
+      size += enc.flush().length;
+      return jsonResponse(at("done", { mp3: size }));
+    }
+    if (step === "decode" || step === "combo" || step === "convert") {
+      const track = await resolveTrack(link);
+      let bytes: Uint8Array | null = null;
+      let srcExt = "mp3";
+      for (const cand of buildCandidates(track, "auto")) {
+        try {
+          const out = await renderCandidate(track, cand);
+          bytes = out.bytes;
+          srcExt = out.ext;
+          break;
+        } catch {
+          // next candidate
+        }
+      }
+      if (!bytes) return jsonResponse(at("no-source"));
+      const info: Record<string, unknown> = { srcExt, srcSize: bytes.length, gotSource: Date.now() - t0 };
+      if (step === "decode") {
+        const pcm = await decodeSegment(bytes, srcExt);
+        info.pcmSamples = pcm.channelData.map((c) => c.length);
+        return jsonResponse(at("done", info));
+      }
+      if (step === "combo") {
+        const pcm = await decodeSegment(bytes, srcExt);
+        info.decoded = Date.now() - t0;
+        const wme = await loadWme();
+        const wasm = await loadMp3Wasm();
+        info.wasmLoaded = Date.now() - t0;
+        const enc = await wme.WasmMediaEncoder.create("audio/mpeg", wasm);
+        enc.configure({ channels: 2, sampleRate: pcm.sampleRate, bitrate: 320 });
+        info.configured = Date.now() - t0;
+        let size = 0;
+        const n = pcm.channelData[0].length;
+        for (let off = 0; off < n; off += 8192) {
+          size += enc.encode(pcm.channelData.slice(0, 2).map((c) => c.subarray(off, Math.min(off + 8192, n)))).length;
+        }
+        info.encoded = Date.now() - t0;
+        size += enc.finalize().length;
+        enc.free?.();
+        return jsonResponse(at("done", { ...info, mp3: size }));
+      }
+      const out = await convertAudio(bytes, srcExt, "mp3");
+      return jsonResponse(at("done", { ...info, mp3: out.bytes.length }));
+    }
+    return jsonResponse(at("unknown-step"));
+  } catch (err) {
+    return jsonResponse({ step, ms: Date.now() - t0, error: err instanceof ApiError ? err.code : String((err as Error)?.message || err) });
+  }
+}
 
 /** GET /api/audio?...&debug=probe -> JSON diagnostics instead of audio bytes. */
 async function probeAudio(url: string, fmt: string): Promise<Response> {
@@ -1523,13 +2151,21 @@ export async function handleRequest(req: Request): Promise<Response> {
       if (url.searchParams.get("debug") === "probe") {
         return await probeAudio(link, fmt);
       }
-      return await serveAudio(link, fmt, path === "/api/download");
+      if (url.searchParams.get("debug") === "stage") {
+        return await runStage(link, url.searchParams.get("step") || "wasm");
+      }
+      const chunkRaw = url.searchParams.get("chunk");
+      const chunkSel: number | "info" | null = chunkRaw === "info" ? "info" : chunkRaw !== null ? Number(chunkRaw) : null;
+      if (chunkRaw !== null && chunkSel !== "info" && !(Number.isInteger(chunkSel) && (chunkSel as number) >= 0)) {
+        throw new ApiError(400, "invalid_chunk", "chunk must be a non-negative integer or 'info'.");
+      }
+      return await serveAudio(link, fmt, path === "/api/download", chunkSel);
     }
     return errorResponse(new ApiError(404, "not_found", "No such endpoint."));
   } catch (err) {
     if (err instanceof ApiError) return errorResponse(err);
     const message = err instanceof Error ? err.message : String(err);
-    return errorResponse(new ApiError(500, "internal", message.slice(0, 300)));
+    return errorResponse(new ApiError(500, "internal", cleanMessage(message)));
   }
 }
 
