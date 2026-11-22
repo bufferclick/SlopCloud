@@ -440,6 +440,26 @@ const convMp3ChunkFixture = {
   },
 };
 
+// HLS-only source (Die Empty shape): legacy 404s (mock default), the first hls
+// candidate carries real fMP4 segments, the second is dead. Chunk windowing
+// must demux the fMP4 segment to ADTS before converting - and must not mask
+// its own failure behind the dead candidate's stream-URL error.
+const convHlsChunkFixture = {
+  kind: "track",
+  id: 808,
+  title: "Conv HLS Chunk",
+  duration: 8000,
+  permalink_url: "https://soundcloud.com/test/conv-hlschunk",
+  user: { username: "c" },
+  media: {
+    transcodings: [
+      { url: "https://api-v2.soundcloud.com/media/soundcloud:tracks:808/stream/hls/chunky", format: { protocol: "hls", mime_type: 'audio/mp4; codecs="mp4a.40.2"' }, quality: "sq" },
+      { url: "https://api-v2.soundcloud.com/media/soundcloud:tracks:808/stream/hls/chunky404", format: { protocol: "hls", mime_type: 'audio/mp4; codecs="mp4a.40.2"' }, quality: "sq" },
+      { url: "https://api-v2.soundcloud.com/media/soundcloud:tracks:808/stream/hls/mpeg404", format: { protocol: "hls", mime_type: "audio/mpegurl" }, quality: "sq" },
+    ],
+  },
+};
+
 const opusMediaPlaylist = [
   "#EXTM3U",
   '#EXT-X-MAP:URI="init.ogg"',
@@ -592,6 +612,7 @@ globalThis.fetch = async (input, init) => {
     if (target.includes("media-flaky")) return J(mediaFlakyFixture);
     if (target.includes("all-down")) return J(allDownFixture);
     if (target.includes("conv-mp3chunk")) return J(convMp3ChunkFixture);
+    if (target.includes("conv-hlschunk")) return J(convHlsChunkFixture);
     if (target.includes("conv-mp3")) return J(convMp3Fixture);
     if (target.includes("conv-aac")) return J(convAacFixture);
     if (target.includes("conv-long")) return J(convLongFixture);
@@ -664,6 +685,8 @@ globalThis.fetch = async (input, init) => {
   }
   if (u.includes("soundcloud:tracks:613") && u.includes("/stream/progressive")) return J({ error: "not found" }, 404);
   if (u.includes("/stream/progressive")) return J({ url: "https://cf-media.sndcdn.com/tkHfEWxK.mp3" });
+  if (u.includes("/stream/hls/chunky404") || u.includes("/stream/hls/mpeg404")) return R("gone", 404);
+  if (u.includes("/stream/hls/chunky")) return J({ url: "https://cf-hls-media.sndcdn.com/chunky/media/playlist.m3u8" });
   if (u.includes("/stream/hls/badaac")) return J({ url: "https://cf-hls-media.sndcdn.com/bad/playlist.m3u8" });
   if (u.includes("/stream/hls/missing615")) return J({ error: "not found" }, 404);
   if (u.includes("/stream/hls/ts")) return J({ url: "https://cf-hls-media.sndcdn.com/ts/playlist.m3u8" });
@@ -707,6 +730,21 @@ globalThis.fetch = async (input, init) => {
   if (u.startsWith("https://cf-hls-media.sndcdn.com/opus/seg2.ogg")) return R(new Uint8Array([2, 2]));
   if (u.startsWith("https://cf-hls-media.sndcdn.com/aac/master.m3u8")) return R(aacMasterPlaylist);
   if (u.startsWith("https://cf-hls-media.sndcdn.com/aac/media/playlist.m3u8")) return R(aacMediaPlaylist);
+  if (u === "https://cf-hls-media.sndcdn.com/chunky/media/playlist.m3u8") {
+    return R([
+      "#EXTM3U",
+      "#EXT-X-VERSION:4",
+      "#EXT-X-TARGETDURATION:4",
+      '#EXT-X-MAP:URI="init.mp4"',
+      "#EXTINF:4.000,",
+      "frag1.m4s",
+      "#EXTINF:4.000,",
+      "frag2.m4s",
+      "#EXT-X-ENDLIST",
+    ].join("\n"));
+  }
+  if (u.startsWith("https://cf-hls-media.sndcdn.com/chunky/media/init.mp4")) return R(stypFmp4.init);
+  if (u.startsWith("https://cf-hls-media.sndcdn.com/chunky/media/frag")) return R(stypFmp4.frags);
   if (u.startsWith("https://cf-hls-media.sndcdn.com/aac/media/init.mp4")) {
     return R(new Uint8Array([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x35]));
   }
@@ -1213,6 +1251,29 @@ async function call(path, init) {
     "mp3-source chunk converts to opus (OggS)", String(o0.status));
   const o2 = await call("/api/audio?url=" + P + "&format=opus&chunk=2");
   ok(o2.status === 200, "mp3-source last chunk ok", String(o2.status));
+}
+
+// 12. HLS-branch chunk conversion (real fMP4 segments must be demuxed first)
+{
+  console.log("hls chunk conversion:");
+  const H = encodeURIComponent("https://soundcloud.com/test/conv-hlschunk");
+  const hInfo = await (await call("/api/audio?url=" + H + "&format=mp3&chunk=info")).json();
+  ok(hInfo.chunk_count === 2 && hInfo.chunk_seconds === 0,
+    "hls chunk=info counts segments", JSON.stringify(hInfo));
+
+  const h0 = await call("/api/audio?url=" + H + "&format=mp3&chunk=0");
+  const h0b = new Uint8Array(await h0.arrayBuffer());
+  ok(h0.status === 200 && h0b[0] === 0xff && h0.headers.get("X-SSDA-Extension") === "mp3",
+    "hls fMP4 segment converts to mp3 (demuxed before encode)", String(h0.status) + " head=" + h0b[0] + " extHdr=" + h0.headers.get("X-SSDA-Extension") + " type=" + h0.headers.get("Content-Type"));
+  ok(h0.headers.get("X-SSDA-Chunk-Index") === "0" && h0.headers.get("X-SSDA-Chunk-Count") === "2",
+    "hls chunk headers", h0.headers.get("X-SSDA-Chunk-Index") + "/" + h0.headers.get("X-SSDA-Chunk-Count"));
+
+  const h1 = await call("/api/audio?url=" + H + "&format=mp3&chunk=1");
+  const h1b = new Uint8Array(await h1.arrayBuffer());
+  ok(h1.status === 200 && h1b[0] === 0xff, "hls second chunk ok", String(h1.status));
+
+  const h9 = await call("/api/audio?url=" + H + "&format=mp3&chunk=2");
+  ok(h9.status === 404, "hls chunk past the end -> 404", String(h9.status));
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

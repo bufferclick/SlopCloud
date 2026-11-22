@@ -237,7 +237,7 @@ function loadOpusEncoder() {
 }
 
 const SERVICE_NAME = "SSDA";
-const VERSION = "2.8.0";
+const VERSION = "2.8.1";
 // SoundCloud's anti-abuse hard-404s requests that impersonate desktop
 // browsers from datacenter IPs; a plain self-identifying UA passes. Keep a
 // browser-like UA only for fetching SoundCloud's own HTML/JS bundles.
@@ -830,10 +830,10 @@ function buildCandidates(track: ScTrack, fmt: string): Candidate[] {
 async function getStreamUrl(transcoding: Transcoding, track?: ScTrack): Promise<string> {
   let lastStatus = 0;
   let ta = track?.track_authorization ?? null;
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < 5; attempt++) {
     if (attempt > 0) {
       clientIdCache = null;
-      await sleep(350 * attempt);
+      await sleep(500 * attempt);
     }
     const cid = await getClientId();
     const u = new URL(transcoding.url);
@@ -841,16 +841,22 @@ async function getStreamUrl(transcoding: Transcoding, track?: ScTrack): Promise<
     if (ta && !u.searchParams.has("track_authorization")) {
       u.searchParams.set("track_authorization", ta);
     }
-    const res = await fetch(u.href, {
-      headers: { Accept: "application/json", "User-Agent": UA },
-      signal: AbortSignal.timeout(20000),
-    });
-    lastStatus = res.status;
-    if (res.ok) {
-      const data = await res.json();
-      if (data?.url) return data.url;
-    } else if (res.status !== 401 && res.status !== 403 && res.status !== 404) {
-      break; // not a token problem; retrying will not help
+    let res: Response;
+    try {
+      res = await fetch(u.href, {
+        headers: { Accept: "application/json", "User-Agent": UA },
+        signal: AbortSignal.timeout(20000),
+      });
+      lastStatus = res.status;
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.url) return data.url;
+      } else if (res.status !== 401 && res.status !== 403 && res.status !== 404) {
+        break; // not a token problem; retrying will not help
+      }
+    } catch {
+      // network hiccup or a non-JSON body (anti-abuse page): count as a failed
+      // attempt and retry with a fresh client_id
     }
     // token/authorization problem: fetch a fresh track_authorization even if
     // resolve gave us one (they expire and go stale)
@@ -863,18 +869,24 @@ async function getStreamUrl(transcoding: Transcoding, track?: ScTrack): Promise<
 
 /** Some media URLs need a track_authorization that resolve didn't include. */
 async function fetchTrackAuthorization(track: ScTrack): Promise<string | null> {
-  try {
-    const cid = await getClientId();
-    const res = await fetch(`https://api-v2.soundcloud.com/tracks/${track.id}?client_id=${cid}`, {
-      headers: { Accept: "application/json", "User-Agent": UA },
-      signal: AbortSignal.timeout(15000),
-    });
-    if (!res.ok) return null;
-    const d = await res.json();
-    return typeof d?.track_authorization === "string" ? d.track_authorization : null;
-  } catch {
-    return null;
+  for (let i = 0; i < 3; i++) {
+    try {
+      const cid = await getClientId();
+      const res = await fetch(`https://api-v2.soundcloud.com/tracks/${track.id}?client_id=${cid}`, {
+        headers: { Accept: "application/json", "User-Agent": UA },
+        signal: AbortSignal.timeout(15000),
+      });
+      if (res.ok) {
+        const d = await res.json();
+        if (typeof d?.track_authorization === "string") return d.track_authorization;
+      }
+    } catch {
+      // retry below
+    }
+    clientIdCache = null;
+    await sleep(300 * (i + 1));
   }
+  return null;
 }
 
 // ---------------------------------------------------------------- hls
@@ -1692,7 +1704,13 @@ async function serveChunk(track: ScTrack, meta: ReturnType<typeof trackMeta>, ca
       "m4a files cannot be assembled from chunks. Use format=mp3 (or format=opus) for long tracks, or a track shorter than 25 s.",
     );
   }
-  const streamUrl = await getStreamUrl(cand.transcoding, track);
+  let streamUrl: string;
+  try {
+    streamUrl = await getStreamUrl(cand.transcoding, track);
+  } catch (err) {
+    if (err instanceof ApiError) throw new ApiError(err.status, err.code, `streamurl: ${err.message}`);
+    throw err;
+  }
   const proto = cand.transcoding.format?.protocol || "";
   const isDirect = cand.legacy ||
     cand.transcoding.url.includes("/stream/progressive") ||
@@ -1760,8 +1778,12 @@ async function serveChunk(track: ScTrack, meta: ReturnType<typeof trackMeta>, ca
       window = adts;
       srcExt = "aac";
     } else if (container === "fmp4") {
-      window = raw;
-      srcExt = "m4a";
+      // demux the init+segment fMP4 down to raw ADTS frames (one segment is
+      // already one time chunk, so no further windowing is needed)
+      const adts = fmp4ToAdts(raw);
+      if (!adts || adts.length === 0) throw new ApiError(415, "unsupported_container", "fMP4 segment has no AAC frames");
+      window = adts;
+      srcExt = "aac";
     } else if (container === "ogg") {
       throw new ApiError(415, "conversion_failed", "this track's source is opus and cannot be converted to " + fmt);
     } else {
@@ -1797,22 +1819,24 @@ async function serveChunk(track: ScTrack, meta: ReturnType<typeof trackMeta>, ca
  * client_id usually recovers within a second or two.
  */
 async function serveAudio(url: string, fmt: string, attachment: boolean, chunkSel: number | "info" | null): Promise<Response> {
-  try {
-    return await serveAudioPass(url, fmt, attachment, chunkSel);
-  } catch (err) {
-    const transient = err instanceof ApiError && err.code === "upstream" && err.status === 502;
-    if (!transient) throw err;
-    clientIdCache = null;
-    await sleep(700);
+  let lastErr: unknown = null;
+  for (let pass = 0; pass < 3; pass++) {
+    if (pass > 0) {
+      clientIdCache = null;
+      await sleep(1000 * pass);
+    }
     try {
       return await serveAudioPass(url, fmt, attachment, chunkSel);
-    } catch (err2) {
-      if (err2 instanceof ApiError && err2.code === "upstream" && err2.status === 502) {
-        throw new ApiError(502, "upstream", `${err2.message} This is often transient - try again in a few seconds.`);
-      }
-      throw err2;
+    } catch (err) {
+      const transient = err instanceof ApiError && err.code === "upstream" && err.status === 502;
+      if (!transient) throw err;
+      lastErr = err;
     }
   }
+  if (lastErr instanceof ApiError && lastErr.code === "upstream" && lastErr.status === 502) {
+    throw new ApiError(502, "upstream", `${lastErr.message} This is often transient - try again in a few seconds.`);
+  }
+  throw lastErr;
 }
 
 async function serveAudioPass(url: string, fmt: string, attachment: boolean, chunkSel: number | "info" | null): Promise<Response> {
@@ -1830,10 +1854,12 @@ async function serveAudioPass(url: string, fmt: string, attachment: boolean, chu
       } catch (err) {
         if (err instanceof ApiError && (err.code === "invalid_chunk" || err.code === "chunking_not_supported_for_format")) throw err;
         if (err instanceof ApiError) {
-          lastErr = err;
+          const tag = `[cand=${cand.kind}${cand.legacy ? ",legacy" : ""}${cand.download ? ",dl" : ""}]`;
+          lastErr = new ApiError(err.status, err.code, `${err.message} ${tag}`);
           continue;
         }
-        throw err;
+        const msg = err instanceof Error ? err.message : String(err);
+        throw new ApiError(500, "internal", cleanMessage(`${msg} [cand=${cand.kind}${cand.legacy ? ",legacy" : ""}]`));
       }
     }
     throw lastErr ?? new ApiError(403, "not_streamable", "No usable audio rendition found for this track.");
