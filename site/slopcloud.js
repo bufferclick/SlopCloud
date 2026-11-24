@@ -376,6 +376,155 @@
     saveToCache: function (apiBase, soundcloudUrl, opts) {
       return SlopCloud.fetchAndCache(apiBase, soundcloudUrl, opts);
     },
+
+    /**
+     * Search YouTube via the YTA server. Returns
+     * [{ video_id, title, author, duration_s, thumbnail_url }].
+     */
+    searchYouTube: async function (apiBase, query) {
+      var base = (apiBase || '').replace(/\/+$/, '');
+      var res = await fetchRetry(base + '/api/search?q=' + encodeURIComponent(query || ''));
+      if (!res.ok) {
+        var errBody = await res.json().catch(function () { return null; });
+        throw apiError('/api/search', base, res, errBody);
+      }
+      var body = await res.json();
+      return body.results || [];
+    },
+
+    /**
+     * Download a YouTube video's audio as 320 kbps mp3 and store it in the
+     * browser cache. opts: { onProgress(loaded,total), skipIfCached=false }
+     * The YTA server keeps its own cache too, so repeat saves are instant.
+     * Returns the song metadata record.
+     */
+    fetchYouTubeAndCache: async function (apiBase, videoUrl, opts) {
+      opts = opts || {};
+      var base = (apiBase || '').replace(/\/+$/, '');
+
+      var infoRes = await fetchRetry(base + '/api/info?url=' + encodeURIComponent(videoUrl));
+      if (!infoRes.ok) {
+        var errBody = await infoRes.json().catch(function () { return null; });
+        throw apiError('/api/info', base, infoRes, errBody);
+      }
+      var info = await infoRes.json();
+      var id = hashId('yt:' + (info.id || videoUrl));
+
+      if (opts.skipIfCached) {
+        var existing = await SlopCloud.getSong(id);
+        if (existing) return existing;
+      }
+
+      var audioUrl = base + '/api/audio?url=' + encodeURIComponent(videoUrl) + '&format=mp3';
+
+      async function readAll(res) {
+        var chunks = [];
+        var loaded = 0;
+        var total = Number(res.headers.get('Content-Length')) || 0;
+        if (res.body && res.body.getReader) {
+          var reader = res.body.getReader();
+          while (true) {
+            var part = await reader.read();
+            if (part.done) break;
+            chunks.push(part.value);
+            loaded += part.value.length;
+            if (opts.onProgress) opts.onProgress(loaded, total);
+          }
+        } else {
+          var buf = await res.arrayBuffer();
+          chunks.push(new Uint8Array(buf));
+          loaded = buf.byteLength;
+          if (opts.onProgress) opts.onProgress(loaded, total);
+        }
+        return { chunks: chunks, loaded: loaded, total: total };
+      }
+
+      var chunks = [];
+      var loaded = 0;
+
+      var res = await fetchRetry(audioUrl);
+      if (res.ok) {
+        var got = await readAll(res);
+        chunks = got.chunks;
+        loaded = got.loaded;
+      } else if (res.status === 413) {
+        // Long video: the server converts per chunk. If every chunk is already
+        // in the server cache it assembles the whole file in one response.
+        var planErr = await res.json().catch(function () { return null; });
+        if (!planErr || !planErr.error || planErr.error.code !== 'chunked_conversion_required') {
+          throw apiError('/api/audio', base, res, planErr);
+        }
+        var allRes = await fetchRetry(audioUrl + '&chunk=all');
+        if (allRes.ok) {
+          var got2 = await readAll(allRes);
+          chunks = got2.chunks;
+          loaded = got2.loaded;
+        } else if (allRes.status === 409) {
+          var missBody = await allRes.json().catch(function () { return null; });
+          var missing = (missBody && missBody.error && missBody.error.missing) || null;
+          if (!missing) {
+            var planRes = await fetchRetry(audioUrl + '&chunk=info');
+            if (!planRes.ok) {
+              var planErr2 = await planRes.json().catch(function () { return null; });
+              throw apiError('/api/audio', base, planRes, planErr2);
+            }
+            var plan = await planRes.json();
+            missing = [];
+            for (var mi = 0; mi < (plan.chunk_count || 0); mi++) missing.push(mi);
+          }
+          for (var ci = 0; ci < missing.length; ci++) {
+            var cres = await fetchRetry(audioUrl + '&chunk=' + missing[ci]);
+            if (!cres.ok) {
+              var cErr = await cres.json().catch(function () { return null; });
+              throw apiError('/api/audio', base, cres, cErr);
+            }
+            var cbuf = new Uint8Array(await cres.arrayBuffer());
+            chunks.push(cbuf);
+            loaded += cbuf.length;
+            if (opts.onProgress) opts.onProgress(loaded, 0);
+          }
+          // chunks are filled on the server now - assemble in one request
+          var allRes2 = await fetchRetry(audioUrl + '&chunk=all');
+          if (!allRes2.ok) {
+            var allErr2 = await allRes2.json().catch(function () { return null; });
+            throw apiError('/api/audio', base, allRes2, allErr2);
+          }
+          var got3 = await readAll(allRes2);
+          chunks = got3.chunks;
+          loaded = got3.loaded;
+        } else {
+          var allErr = await allRes.json().catch(function () { return null; });
+          throw apiError('/api/audio', base, allRes, allErr);
+        }
+      } else {
+        var audioErr = await res.json().catch(function () { return null; });
+        throw apiError('/api/audio', base, res, audioErr);
+      }
+
+      var blob = new Blob(chunks, { type: 'audio/mpeg' });
+      var record = {
+        id: id,
+        title: info.title || 'Untitled',
+        artist: info.artist || 'Unknown artist',
+        duration: info.duration || null,
+        artworkUrl: info.artwork_url || null,
+        sourceUrl: info.permalink_url || videoUrl,
+        ext: 'mp3',
+        mime: 'audio/mpeg',
+        size: blob.size,
+        savedAt: Date.now(),
+        note: '320 kbps mp3 from YouTube',
+        snip: false,
+      };
+
+      var cache = await audioCache();
+      await cache.put(
+        new Request(cacheKey(id)),
+        new Response(blob, { headers: { 'Content-Type': record.mime, 'X-SlopCloud-Title': encodeURIComponent(record.title) } })
+      );
+      await tx(await db(), 'readwrite', function (store) { store.put(record); });
+      return record;
+    },
   };
 
   self.SlopCloud = SlopCloud;

@@ -263,3 +263,22 @@ footer p { margin: 0; }
   .row.controls { flex-direction: column; align-items: stretch; }
   .btn-group .btn { flex: 1; }
 }
+
+/* ---- YouTube search results ---- */
+.yt-results { list-style: none; margin: 12px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.yt-results:empty { display: none; }
+.yt-result {
+  display: flex; gap: 12px; align-items: center;
+  padding: 8px; border: 1px solid var(--line); border-radius: 10px;
+}
+.yt-result img {
+  width: 96px; height: 54px; object-fit: cover; border-radius: 6px; flex: none;
+  background: var(--line);
+}
+.yt-result .yt-meta { flex: 1; min-width: 0; }
+.yt-result .yt-title {
+  font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.yt-result .yt-sub { color: var(--muted); font-size: .85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.yt-result .btn { flex: none; }
+.row input[type="search"] { flex: 1; min-width: 220px; }
