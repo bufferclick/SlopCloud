@@ -105,6 +105,47 @@ The function is deployed in the Supabase project `SlopCloud`
 (`supabase functions deploy ssda --no-verify-jwt`) or through the connected
 Supabase app.
 
+## The YTA API (YouTube)
+
+```
+GET /api/health                              status
+GET /api/search?q=<query>                    search YouTube (JSON results)
+GET /api/info?url=<youtube-link>             video metadata (JSON)
+GET /api/audio?url=<link>&format=mp3|m4a     audio bytes (mp3 is converted)
+GET /api/download?url=<link>                 audio bytes as a file download
+```
+
+Base URL (live, CORS open):
+
+```
+https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/yta
+```
+
+Quick try:
+
+```sh
+curl "https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/yta/api/search?q=lofi"
+curl -o video.mp3 "https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/yta/api/audio?url=https://www.youtube.com/watch?v=jNQXAC9IVRw"
+```
+
+- `url` must be a YouTube link (`youtube.com/watch?v=`, `youtu.be/`,
+  `/shorts/`, `/embed/`, `/live/`). `format=mp3` (default) converts the
+  video's highest-quality AAC audio to 320 kbps mp3; `format=m4a` passes
+  YouTube's own AAC stream through untouched.
+- Long videos convert in chunks exactly like SSDA (`&chunk=info|N|all`,
+  `413 chunked_conversion_required` with the recipe; the site stitches them
+  automatically). Converted chunks, whole files and the raw source are stored
+  in the server-side cache (`X-YTA-Cache: hit` on repeats), so the second
+  download of the same video is instant.
+- When YouTube only offers ciphered/protected streams for a video (they
+  rotate anti-bot profiles per region), the API answers honestly with
+  `415 streams_locked` instead of guessing — nothing is DRM-decrypted here.
+  Age-restricted and members-only videos answer `403 not_available`.
+- Errors are JSON: `{"error": {"code": "...", "message": "..."}}`.
+
+The function is deployed like SSDA (`verify_jwt = false`); source lives in
+`supabase/functions/yta/index.ts`.
+
 ## Use SlopCloud in your own site
 
 Two integration levels.
@@ -178,17 +219,23 @@ python3 -m http.server 8000 --directory site
 ## Tests
 
 ```sh
-npm install          # mirrors the function's npm: imports for Node
-node tools/test-ssda.mjs
+npm install          # mirrors the functions' npm: imports for Node
+node tools/test-ssda.mjs   # SoundCloud pipeline (122 tests)
+node tools/test-yta.mjs    # YouTube pipeline (55 tests)
 ```
 
-66 tests covering routing, format selection, format conversion (real
+The SSDA suite covers routing, format selection, format conversion (real
 decode/re-encode through wasm codecs, including styp-headed fMP4 HLS),
 HLS assembly, container validation, DRM handling, the legacy-stream and
 official-download fallbacks, explicit-format fidelity, short-link expansion,
-resolve-body validation, error shapes, CORS, and resilience (challenge-page
-retries, flaky upstream, oEmbed fallback) — all against a mocked SoundCloud,
-no network needed.
+resolve-body validation, error shapes, CORS, resilience (challenge-page
+retries, flaky upstream, oEmbed fallback), Retry-After backoff, the client_id
+pool, and the server-side cache with `chunk=all` assembly. The YTA suite
+covers search parsing, player/format selection across Innertube clients,
+one-shot and chunked mp3 conversion of a real AAC fixture, m4a passthrough,
+the server-side cache (miss→hit, chunk=all byte-equality), and honest errors
+(ciphered streams, age restrictions, opus-only videos, oversized sources) —
+all against mocked upstreams, no network needed.
 
 ## Notes
 
