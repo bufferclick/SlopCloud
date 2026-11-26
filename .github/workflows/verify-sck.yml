@@ -1,0 +1,25 @@
+name: verify-sck
+on:
+  workflow_dispatch:
+    inputs:
+      path:
+        description: "function path to GET, e.g. /api/health"
+        required: true
+      maxwait:
+        description: "curl max seconds"
+        required: false
+        default: "120"
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: probe the deployed function
+        run: |
+          BASE="https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/sck"
+          echo "== GET ${BASE}${{ inputs.path }}"
+          code=$(curl -sS -o /tmp/out.bin -w '%{http_code}' --max-time ${{ inputs.maxwait }} \
+            -H 'Origin: https://bufferclick.github.io' \
+            "${BASE}${{ inputs.path }}")
+          echo "== HTTP $code, $(wc -c < /tmp/out.bin) bytes"
+          head -c 2500 /tmp/out.bin
+          echo
