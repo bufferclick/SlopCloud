@@ -146,6 +146,80 @@ curl -o video.mp3 "https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/yta/api
 The function is deployed like SSDA (`verify_jwt = false`); source lives in
 `supabase/functions/yta/index.ts`.
 
+## The SCA API (SoundCloud downloader, api-anything recipes)
+
+SCA is a SoundCloud downloader API built on the **api-anything**
+([goodnight000/api-anything](https://github.com/goodnight000/api-anything))
+learned-recipe format: "turn any website into an API your agent can call".
+The recipes live in `sites/soundcloud.json` (the exact schema api-anything's
+learner produces — ops, slots, response picks) and `supabase/functions/sca`
+is the tier-1 replay runner for them plus a downloader built from their
+chain: **resolveTrack → pick a progressive transcoding → getStreamUrl → GET
+the returned URL**, one request per op exactly like api-anything's op
+granularity. The downloader takes three honest paths, in order: a
+**progressive mp3 is passed through unconverted**; a plain (unencrypted) HLS
+track is **assembled and converted to mp3 by our own ssda engine** and
+streamed through (long tracks are chunked and stitched server-side); and
+**encrypted-HLS-only tracks stay locked** — `403 encrypted_stream`, no keys,
+no CDM, no signed-in session. Go+/blocked tracks are refused the same way.
+As of late 2026 SoundCloud serves many tracks as encrypted
+`cbc/ctr-encrypted-hls` only; those are refused by name rather than
+circumvented.
+
+The same recipes are upstream-contribution ready: `sites/soundcloud.json`
+follows the site-file schema of api-anything's own `sites/` catalog and can
+be contributed there.
+
+```
+GET /api/health                     status
+GET /api/ops                        the learned operations + parameters
+GET /api/call?op=<op>&<param>=...   run one learned operation (api-anything style)
+GET /api/search?q=<query>           search public tracks
+GET /api/info?url=<track-url>       track record + transcodings
+GET /api/audio?url=<track-url>      the audio bytes (mp3: passthrough or ssda conversion)
+GET /api/download?url=<track-url>   same, as a file download
+```
+
+```bash
+SCA=https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/sca
+
+# What the API knows (the learned operations)
+curl "$SCA/api/ops"
+
+# Search, then save through the site (or read the picked fields here)
+curl "$SCA/api/search?q=harvey"
+
+# Track record with the transcodings a downloader picks from
+curl "$SCA/api/info?url=https://soundcloud.com/alexg232/harvey"
+
+# The downloader itself - the mp3 bytes
+curl -L "$SCA/api/audio?url=https://soundcloud.com/alexg232/harvey" -o harvey.mp3
+
+# Or replay any learned operation directly, api-anything style
+curl "$SCA/api/call?op=searchTracks&q=harvey"
+```
+
+Notes:
+- The `client_id` SoundCloud ships in its own JS (api-anything keeps such
+  values literal as `public` constants) is refreshed automatically by the
+  runner: it reads the site's asset bundles and rotates pooled ids, the same
+  self-healing idea api-anything's repair step exists for.
+- Honest refusals, no silent substitution: blocked/Go+ tracks answer
+  `403 restricted`; encrypted-HLS-only tracks answer `403 encrypted_stream`
+  (named protocols, "no keys, no CDM"); non-mp3 progressive files stay their
+  own format with an explicit label; preview (SNIP) tracks download labeled
+  `preview/snip`.
+- Every audio response carries `X-SCA-Source` (exactly what produced the
+  bytes: `soundcloud progressive mp3 (passthrough)`, `hls assembled +
+  converted to mp3 by the ssda engine`, …) and `X-SCA-Extension`.
+- The site's SoundCloud search box is powered by this API; saves go through
+  the normal SSDA flow with SCA as the automatic fallback engine.
+- Errors are JSON: `{"error": {"code": "...", "message": "..."}}`.
+- Tests: `node tools/test-sca.mjs` (all mocked, no network).
+
+The function is deployed like SSDA (`verify_jwt = false`); source lives in
+`supabase/functions/sca/index.ts`.
+
 ## Use SlopCloud in your own site
 
 Two integration levels.
@@ -221,7 +295,11 @@ python3 -m http.server 8000 --directory site
 ```sh
 npm install          # mirrors the functions' npm: imports for Node
 node tools/test-ssda.mjs   # SoundCloud pipeline (122 tests)
+node tools/test-yta.mjs    # YouTube pipeline (59 tests)
+node tools/test-sca.mjs    # SCA recipe replay + downloader API (29 tests)
+=======
 node tools/test-yta.mjs    # YouTube pipeline (55 tests)
+>>>>>>> origin/main
 ```
 
 The SSDA suite covers routing, format selection, format conversion (real

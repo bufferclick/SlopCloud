@@ -38,6 +38,10 @@
     playerClose: $('player-close'),
     ytSearchForm: $('yt-search-form'),
     ytSearchInput: $('yt-search-input'),
+    scSearchForm: $('sc-search-form'),
+    scSearchInput: $('sc-search-input'),
+    scSearchResults: $('sc-search-results'),
+    scSearchStatus: $('sc-search-status'),
     ytResults: $('yt-results'),
     ytForm: $('yt-form'),
     ytUrl: $('yt-url-input'),
@@ -365,6 +369,10 @@
   var YT_API_BASE = localStorage.getItem('yta.api') ||
     'https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/yta';
 
+  // SCA - SoundCloud downloader API built on api-anything's learned recipes.
+  var SCA_API_BASE = localStorage.getItem('sca.api') ||
+    'https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/sca';
+
   function ytSetStatus(msg, kind) {
     els.ytStatus.textContent = msg || '';
     els.ytStatus.className = 'status' + (kind ? ' ' + kind : '');
@@ -460,6 +468,76 @@
     }
   }
 
+  // ---------- SoundCloud search (SCA) + save via the normal flow ----------
+
+  function scSetStatus(msg, kind) {
+    els.scSearchStatus.textContent = msg || '';
+    els.scSearchStatus.className = 'status' + (kind ? ' ' + kind : '');
+  }
+
+  function scBusy(on) {
+    els.scSearchForm.querySelectorAll('button, input').forEach(function (el) { el.disabled = on; });
+  }
+
+  async function scSearch(query) {
+    var q = (query || '').trim();
+    if (!q) return;
+    els.scSearchResults.innerHTML = '';
+    scBusy(true);
+    scSetStatus('Searching SoundCloud…');
+    try {
+      var results = await SlopCloud.searchSoundCloud(SCA_API_BASE, q);
+      if (!results.length) {
+        scSetStatus('No results for "' + q + '".', 'error');
+        return;
+      }
+      scSetStatus(results.length + ' results. Save any of them through the normal save flow.', 'ok');
+      for (var i = 0; i < results.length; i++) {
+        (function (r) {
+          var li = document.createElement('li');
+          li.className = 'yt-result';
+          var img = document.createElement('img');
+          img.src = r.artwork || '';
+          img.alt = '';
+          img.loading = 'lazy';
+          var meta = document.createElement('div');
+          meta.className = 'yt-meta';
+          var title = document.createElement('div');
+          title.className = 'yt-title';
+          title.textContent = r.title || 'Untitled';
+          var sub = document.createElement('div');
+          sub.className = 'yt-sub';
+          sub.textContent = (r.artist || '') + (r.durationMs ? ' · ' + fmtDuration(Math.round(r.durationMs / 1000)) : '');
+          meta.appendChild(title);
+          meta.appendChild(sub);
+          var btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'btn primary small';
+          btn.textContent = 'Save';
+          btn.addEventListener('click', function () {
+            els.url.value = r.permalink || '';
+            saveToCache();
+          });
+          li.appendChild(img);
+          li.appendChild(meta);
+          li.appendChild(btn);
+          els.scSearchResults.appendChild(li);
+        })(results[i]);
+      }
+    } catch (e) {
+      scSetStatus(e.message, 'error');
+    } finally {
+      scBusy(false);
+    }
+  }
+
+  els.scSearchForm.addEventListener('submit', function (e) {
+    e.preventDefault();
+    var q = els.scSearchInput.value.trim();
+    if (!q) return;
+    scSearch(q);
+  });
+
   async function ytSave(videoUrl, toFiles) {
     var url = (videoUrl || '').trim();
     if (!url) {
@@ -528,10 +606,19 @@
     setStatus('Fetching track info…');
     showProgress(0, 0);
     try {
-      var record = await SlopCloud.fetchAndCache(API_BASE, url, {
-        format: els.format.value,
-        onProgress: showProgress,
-      });
+      var record;
+      try {
+        record = await SlopCloud.fetchAndCache(API_BASE, url, {
+          format: els.format.value,
+          onProgress: showProgress,
+        });
+      } catch (err) {
+        // The ssda engine could not save it - try the SCA downloader API
+        // (api-anything recipe chain, mp3 passthrough) before giving up.
+        record = await SlopCloud.fetchViaScaAndCache(SCA_API_BASE, url, {
+          onProgress: showProgress,
+        }).catch(function () { throw err; });
+      }
       var saved = 'Saved to cache: ' + record.artist + ' – ' + record.title;
       if (record.note) saved += ' (' + record.note + ')';
       if (record.snip) saved += ' – preview-only track, may be short';

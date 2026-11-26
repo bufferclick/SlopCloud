@@ -525,6 +525,67 @@
       await tx(await db(), 'readwrite', function (store) { store.put(record); });
       return record;
     },
+
+    // ---- SCA (api-anything recipe API) client ----------------------------
+
+    searchSoundCloud: async function (apiBase, query) {
+      var base = (apiBase || '').replace(/\/+$/, '');
+      var res = await fetch(base + '/api/search?q=' + encodeURIComponent(query), { signal: (arguments[2] && arguments[2].signal) || undefined });
+      var body = await res.json().catch(function () { return null; });
+      if (!res.ok) {
+        throw new Error((body && body.error && body.error.message) || ('Search failed (HTTP ' + res.status + ').'));
+      }
+      return body.results || [];
+    },
+
+    // Downloader fallback: when the ssda engine cannot save a track, ask the
+    // SCA downloader API (api-anything recipe chain, mp3 passthrough) instead.
+    fetchViaScaAndCache: async function (apiBase, soundcloudUrl, opts) {
+      opts = opts || {};
+      var base = (apiBase || '').replace(/\/+$/, '');
+
+      var infoRes = await fetch(base + '/api/info?url=' + encodeURIComponent(soundcloudUrl), { signal: opts.signal || undefined });
+      if (!infoRes.ok) {
+        var errBody = await infoRes.json().catch(function () { return null; });
+        throw new Error((errBody && errBody.error && errBody.error.message) || ('SCA /api/info failed (HTTP ' + infoRes.status + ').'));
+      }
+      var info = await infoRes.json();
+      var id = hashId(info.permalink || soundcloudUrl);
+
+      var audioRes = await fetch(base + '/api/audio?url=' + encodeURIComponent(soundcloudUrl), { signal: opts.signal || undefined });
+      if (!audioRes.ok) {
+        var audioBody = await audioRes.json().catch(function () { return null; });
+        throw new Error((audioBody && audioBody.error && audioBody.error.message) || ('SCA /api/audio failed (HTTP ' + audioRes.status + ').'));
+      }
+      var abuf = new Uint8Array(await audioRes.arrayBuffer());
+      var type = (audioRes.headers.get('Content-Type') || 'audio/mpeg').split(';')[0].trim();
+      var ext = (audioRes.headers.get('X-SCA-Extension') || { 'audio/mpeg': 'mp3', 'audio/ogg': 'ogg', 'audio/mp4': 'm4a' }[type] || 'mp3');
+      var sourceNote = audioRes.headers.get('X-SCA-Source') || '';
+
+      var blob = new Blob([abuf], { type: type });
+      var record = {
+        id: id,
+        title: info.title || 'Untitled',
+        artist: info.artist || 'Unknown artist',
+        duration: info.durationMs || null,
+        artworkUrl: info.artwork || null,
+        sourceUrl: info.permalink || soundcloudUrl,
+        ext: ext,
+        mime: type,
+        size: blob.size,
+        savedAt: Date.now(),
+        note: 'via SCA downloader' + (sourceNote ? ' – ' + sourceNote : ''),
+        snip: false,
+      };
+
+      var cache = await audioCache();
+      await cache.put(
+        new Request(cacheKey(id)),
+        new Response(blob, { headers: { 'Content-Type': record.mime, 'X-SlopCloud-Title': encodeURIComponent(record.title) } })
+      );
+      await tx(await db(), 'readwrite', function (store) { store.put(record); });
+      return record;
+    },
   };
 
   self.SlopCloud = SlopCloud;

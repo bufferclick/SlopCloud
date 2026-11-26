@@ -47,6 +47,16 @@
 
   <section class="card" aria-labelledby="add-h">
     <h2 id="add-h">Add a SoundCloud song</h2>
+    <form id="sc-search-form">
+      <label for="sc-search-input">Search SoundCloud</label>
+      <div class="row">
+        <input id="sc-search-input" type="search" spellcheck="false"
+               placeholder="song or artist — or paste a soundcloud.com link">
+        <button type="submit" id="sc-search-btn" class="btn primary">Search</button>
+      </div>
+    </form>
+    <p id="sc-search-status" class="status" role="status"></p>
+    <ul id="sc-search-results" class="yt-results"></ul>
     <form id="add-form">
       <label for="url-input">SoundCloud link</label>
       <div class="row">
