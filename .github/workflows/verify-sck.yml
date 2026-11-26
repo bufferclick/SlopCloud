@@ -37,3 +37,5 @@ jobs:
         run: |
           { echo "### verify-sck probe results ($(date -u +%H:%M:%SZ))"; echo '```'; cat results.txt 2>/dev/null; echo '```'; } > /tmp/comment.md
           gh pr comment 12 --repo "$GITHUB_REPOSITORY" --body-file /tmp/comment.md || echo "comment failed"
+
+# trigger 123139

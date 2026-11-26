@@ -1,28 +1,76 @@
-// SCK - SlopCloud KlickAud API: an API OF klickaud.org, the SoundCloud
-// downloader website. Single-file Supabase Edge Function.
-//
-// The API automates the website exactly like a user does:
-//   1. paste the SoundCloud URL  -> POST klickaud's download.php (with CSRF)
-//   2. press Convert             -> klickaud prepares the track
-//   3. press "DOWNLOAD THE SONG" -> follow the direct link, or the site's
-//                                   worker SSE stream, to the mp3 bytes
-//
-//   GET /api/health             status
-//   GET /api/info?url=<sc-url>  run the flow, return the track title + mode
-//   GET /api/audio?url=<sc-url> the song: mp3 bytes
-//   GET /api/download?url=...   same, as a file download
-//
-// Everything happens on klickaud.org's servers - this function is the honest
-// automation layer in front of it. Every response says so: X-SCK-Source is
-// always "klickaud.org (third-party converter)". Klickaud's availability and
-// output quality are theirs, not ours; failures are reported by name.
+/*
+ * SCK - SlopCloud KlickAud API: an API OF klickaud.org, the SoundCloud
+ * downloader website. Single-file Supabase Edge Function.
+ *
+ * The API automates the website exactly like a user does:
+ *   1. paste the SoundCloud URL  -> POST klickaud's download.php (with CSRF)
+ *   2. press Convert             -> klickaud prepares the track
+ *   3. press "DOWNLOAD THE SONG" -> follow the direct link, or the site's
+ *                                   worker SSE stream, to the mp3 bytes
+ *
+ *   GET /api/health             status
+ *   GET /api/info?url=SCURL     run the flow, return the track title + mode
+ *   GET /api/audio?url=SCURL    the song: mp3 bytes
+ *   GET /api/download?url=...   same, as a file download
+ *   GET /api/debug?url=SCURL    what each site step answered (maintenance)
+ *
+ * Everything happens on klickaud.org's servers - this function is the honest
+ * automation layer in front of it. Every response says so: X-SCK-Source is
+ * always "klickaud.org (third-party converter)". Klickaud's availability and
+ * output quality are theirs, not ours; failures are reported by name.
+ *
+ * TRANSPORT NOTE: this file contains ZERO backslash characters and ZERO
+ * line comments, and builds every RegExp at runtime from character codes,
+ * so it survives JSON transport unscathed regardless of escaping layers.
+ */
 
 const SERVICE_NAME = `SCK`;
-const VERSION = `1.0.0`;
+const VERSION = `1.0.1`;
 const UA =
   `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36`;
 const BASE = `https://www.klickaud.org`;
 const SOURCE_LABEL = `klickaud.org (third-party converter)`;
+
+const BS = String.fromCharCode(92);
+const DQ = String.fromCharCode(34);
+const SQ = String.fromCharCode(39);
+const NL = String.fromCharCode(10);
+const CR = String.fromCharCode(13);
+const TAB = String.fromCharCode(9);
+const FF = String.fromCharCode(12);
+const VT = String.fromCharCode(11);
+
+function rx(pattern: string, flags?: string): RegExp {
+  return new RegExp(pattern, flags);
+}
+
+const RE_WS = rx(`[ ${TAB}${CR}${NL}${FF}${VT}]+`, `g`);
+const RE_KLICKAUD_SUFFIX = rx(`_KLICKAUD${BS}.mp3$`, `i`);
+const RE_FORHUB_SUFFIX = rx(`_forhub_soundcloud_to_mp3${BS}.mp3$`, `i`);
+const RE_MP3_SUFFIX = rx(`${BS}.mp3$`, `i`);
+const RE_UNDERSCORE = rx(`_`, `g`);
+
+function qClass(): string {
+  return `[${DQ}${SQ}]`;
+}
+
+function constRegex(name: string): RegExp {
+  return rx(`${name}${BS}s*=${BS}s*${qClass()}([^${DQ}${SQ}]+)${qClass()}`);
+}
+
+const RE_DOWNLOAD_MODE = constRegex(`downloadMode`);
+const RE_DIRECT_URL = constRegex(`directDownloadUrl`);
+const RE_FILE_NAME = constRegex(`defaultFileName`);
+const RE_SSE_GRANT = constRegex(`sseGrant`);
+const RE_HAS_CONSTANTS = rx(`downloadMode${BS}s*=`);
+const RE_VERIFY_FORM = rx(`<form[^>]*download${BS}.php`, `i`);
+const RE_HIDDEN_INPUT = rx(`<input[^>]*type=${qClass()}hidden${qClass()}[^>]*>`, `gi`);
+const RE_INPUT_NAME = rx(`name=${qClass()}([^${DQ}${SQ}]+)${qClass()}`);
+const RE_INPUT_VALUE = rx(`value=${qClass()}([^${DQ}${SQ}]*)${qClass()}`);
+const RE_CSRF_JSON = rx(`${DQ}csrf_token${DQ}${BS}s*:${BS}s*${DQ}([^${DQ}]+)${DQ}`);
+const RE_SSE_DATA = rx(`^data:${BS}s*`);
+const RE_FILENAME_BAD = rx(`[${BS}${BS}/:*?${DQ}<>|]`, `g`);
+const RE_NON_ASCII = rx(`[^${BS}x20-${BS}x7e]`, `g`);
 
 class ApiError extends Error {
   status: number;
@@ -37,10 +85,8 @@ class ApiError extends Error {
 }
 
 function htmlSnippet(html: string): string {
-  return html.replace(/\s+/g, ` `).trim().slice(0, 900);
+  return html.replace(RE_WS, ` `).trim().slice(0, 900);
 }
-
-// ---------------------------------------------------------------- cookies
 
 class Jar {
   cookies: Record<string, string> = {};
@@ -59,8 +105,6 @@ class Jar {
   }
 }
 
-// ---------------------------------------------------------------- the dance
-
 type Converted = {
   title: string;
   mode: `direct` | `worker`;
@@ -68,13 +112,12 @@ type Converted = {
   jar: Jar;
 };
 
-/** klickaud's own title cleanup: "_KLICKAUD.mp3" etc. -> a plain title. */
 function cleanTitle(raw: string): string {
   return raw
-    .replace(/_KLICKAUD\.mp3$/i, ``)
-    .replace(/_forhub_soundcloud_to_mp3\.mp3$/i, ``)
-    .replace(/\.mp3$/i, ``)
-    .replace(/_/g, ` `)
+    .replace(RE_KLICKAUD_SUFFIX, ``)
+    .replace(RE_FORHUB_SUFFIX, ``)
+    .replace(RE_MP3_SUFFIX, ``)
+    .replace(RE_UNDERSCORE, ` `)
     .trim();
 }
 
@@ -114,22 +157,16 @@ async function kfetch(jar: Jar, url: string, init: RequestInit, timeoutMs: numbe
   return res;
 }
 
-/**
- * Run the whole website flow for one SoundCloud URL: CSRF -> convert ->
- * (direct link | SSE worker). Returns the mp3 URL and klickaud's title.
- */
 export async function convert(soundcloudUrl: string): Promise<Converted> {
   assertSoundcloudUrl(soundcloudUrl);
   const jar = new Jar();
 
-  // Step 0 - open the site first, like a user's browser (session cookies).
   try {
     await kfetch(jar, `${BASE}/en17/`, {
       headers: { Accept: `text/html,application/xhtml+xml` },
     }, 15000);
   } catch { /* warm-up only; the steps below report real failures */ }
 
-  // Step 1 - the site asks its own server for a CSRF token first.
   const tokenRes = await kfetch(jar, `${BASE}/csrf-token-endpoint.php`, {
     headers: { Referer: `${BASE}/en17/`, Accept: `application/json` },
   }, 15000);
@@ -143,7 +180,6 @@ export async function convert(soundcloudUrl: string): Promise<Converted> {
     );
   }
 
-  // Step 2 - paste the URL and press Convert.
   const form = new URLSearchParams();
   form.append(`value`, soundcloudUrl);
   form.append(`csrf_token`, csrf);
@@ -158,19 +194,16 @@ export async function convert(soundcloudUrl: string): Promise<Converted> {
   }, 30000);
   const firstHtml = await postRes.text();
   const html = await continueThroughVerify(jar, soundcloudUrl, csrf, postRes.status, firstHtml);
-  const downloadMode = (html.match(/downloadMode\s*=\s*["']([^"']+)["']/) || [])[1] || ``;
-  const directUrl = (html.match(/directDownloadUrl\s*=\s*["']([^"']*)["']/) || [])[1] || ``;
-  const defaultFileName = (html.match(/defaultFileName\s*=\s*["']([^"']+)["']/) || [])[1] || `SoundCloud Track`;
-  const sseGrant = (html.match(/sseGrant\s*=\s*["']([^"']+)["']/) || [])[1] || ``;
+  const downloadMode = (html.match(RE_DOWNLOAD_MODE) || [])[1] || ``;
+  const directUrl = (html.match(RE_DIRECT_URL) || [])[1] || ``;
+  const defaultFileName = (html.match(RE_FILE_NAME) || [])[1] || `SoundCloud Track`;
+  const sseGrant = (html.match(RE_SSE_GRANT) || [])[1] || ``;
   const title = cleanTitle(defaultFileName) || `SoundCloud Track`;
 
-  // Mode A - the song is ready right away.
   if (downloadMode === `direct` && directUrl) {
     return { title, mode: `direct`, downloadUrl: directUrl, jar };
   }
 
-  // Mode B - the site's worker prepares the track and streams progress over
-  // SSE ("wait for the download"), ending with the ready link.
   if (!sseGrant) {
     throw new ApiError(
       502,
@@ -221,9 +254,6 @@ export async function convert(soundcloudUrl: string): Promise<Converted> {
 
 type SseResult = { downloadUrl?: string; fileName?: string; failed?: boolean };
 
-// Real human-verification systems - never solved here (no solver services, no
-// stolen sessions; that line is fixed). A page containing one of these stops
-// the flow with an honest, named refusal.
 const CAPTCHA_MARKERS = [
   `hcaptcha`,
   `turnstile`,
@@ -236,11 +266,6 @@ const CAPTCHA_MARKERS = [
   `geo.captcha`,
 ];
 
-/**
- * klickaud sometimes interposes a "Verify your download" form between Convert
- * and the result. If it is a plain hidden-field form, echo it back like the
- * page's own submit does. If it is a real captcha, stop honestly.
- */
 async function continueThroughVerify(
   jar: Jar,
   soundcloudUrl: string,
@@ -248,8 +273,8 @@ async function continueThroughVerify(
   status: number,
   firstHtml: string,
 ): Promise<string> {
-  const hasConstants = /downloadMode\s*=/.test(firstHtml);
-  const hasForm = /<form[^>]*download\.php/i.test(firstHtml);
+  const hasConstants = RE_HAS_CONSTANTS.test(firstHtml);
+  const hasForm = RE_VERIFY_FORM.test(firstHtml);
   if (hasConstants || !hasForm) return firstHtml;
 
   const lowered = firstHtml.toLowerCase();
@@ -266,10 +291,10 @@ async function continueThroughVerify(
   }
 
   const hidden: Record<string, string> = {};
-  for (const m of firstHtml.matchAll(/<input[^>]*type=["']hidden["'][^>]*>/gi)) {
+  for (const m of firstHtml.matchAll(RE_HIDDEN_INPUT)) {
     const tag = m[0];
-    const name = (tag.match(/name=["']([^"']+)["']/) || [])[1];
-    const value = (tag.match(/value=["']([^"']*)["']/) || [])[1] ?? ``;
+    const name = (tag.match(RE_INPUT_NAME) || [])[1];
+    const value = (tag.match(RE_INPUT_VALUE) || [])[1] ?? ``;
     if (name) hidden[name] = value;
   }
   if (Object.keys(hidden).length === 0) return firstHtml;
@@ -297,15 +322,14 @@ async function readSseResult(body: ReadableStream<Uint8Array>): Promise<SseResul
   for (;;) {
     const { done, value } = await reader.read();
     if (value) buffer += decoder.decode(value, { stream: true });
-    // "event: ready" followed by "data: {download_url, file_name}"
     if (buffer.includes(`event: ready`)) {
       const blocks = buffer.split(`event: `);
       for (const block of blocks) {
         if (!block.startsWith(`ready`)) continue;
-        const dataLine = block.split(`\n`).find((l) => l.trim().startsWith(`data:`));
+        const dataLine = block.split(NL).find((l) => l.trim().startsWith(`data:`));
         if (!dataLine) continue;
         try {
-          const data = JSON.parse(dataLine.replace(/^data:\s*/, ``));
+          const data = JSON.parse(dataLine.replace(RE_SSE_DATA, ``));
           if (data.download_url) {
             try { await reader.cancel(); } catch { /* stream may already be gone */ }
             return { downloadUrl: data.download_url, fileName: data.file_name || `` };
@@ -320,8 +344,6 @@ async function readSseResult(body: ReadableStream<Uint8Array>): Promise<SseResul
     if (done) return {};
   }
 }
-
-// ---------------------------------------------------------------- bytes
 
 async function fetchSong(converted: Converted): Promise<Response> {
   const res = await kfetch(converted.jar, converted.downloadUrl, {
@@ -341,21 +363,21 @@ async function fetchSong(converted: Converted): Promise<Response> {
 }
 
 function songHeaders(converted: Converted, attachment: boolean): Headers {
-  const filename = `${(converted.title || `SoundCloud Track`).replace(/[\\/:*?"<>|]/g, ``)}.mp3`;
+  const baseName = (converted.title || `SoundCloud Track`).replace(RE_FILENAME_BAD, ``);
+  const filename = `${baseName}.mp3`;
   const h = new Headers();
   h.set(`Access-Control-Allow-Origin`, `*`);
   h.set(`Content-Type`, `audio/mpeg`);
   h.set(`X-SCK-Source`, SOURCE_LABEL);
   h.set(`X-SCK-Mode`, converted.mode);
   const disposition = attachment ? `attachment` : `inline`;
+  const safeAscii = filename.replace(RE_NON_ASCII, `_`);
   h.set(
     `Content-Disposition`,
-    `${disposition}; filename="${filename.replace(/[^\x20-\x7e]/g, `_`)}"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+    `${disposition}; filename=${DQ}${safeAscii}${DQ}; filename*=UTF-8''${encodeURIComponent(filename)}`,
   );
   return h;
 }
-
-// ---------------------------------------------------------------- responses
 
 function corsHeaders(): Headers {
   const h = new Headers();
@@ -378,11 +400,6 @@ function errorResponse(err: ApiError): Response {
   return jsonResponse({ error: body }, err.status);
 }
 
-/**
- * Maintenance endpoint: shows what klickaud.org actually answers at each step
- * (landing page, CSRF, Convert), truncated - for repairing the flow when the
- * site changes. Same idea as api-anything's "heal itself" story.
- */
 async function debugFlow(soundcloudUrl: string): Promise<unknown> {
   const jar = new Jar();
   const out: Record<string, unknown> = {};
@@ -398,7 +415,7 @@ async function debugFlow(soundcloudUrl: string): Promise<unknown> {
   const tokenText = await tokenRes.text();
   out.csrf = { status: tokenRes.status, snippet: tokenText.slice(0, 300) };
 
-  const csrf = (tokenText.match(/"csrf_token"\s*:\s*"([^"]+)"/) || [])[1] || ``;
+  const csrf = (tokenText.match(RE_CSRF_JSON) || [])[1] || ``;
   const form = new URLSearchParams();
   form.append(`value`, soundcloudUrl);
   form.append(`csrf_token`, csrf);
@@ -416,7 +433,7 @@ async function debugFlow(soundcloudUrl: string): Promise<unknown> {
     status: postRes.status,
     contentType: postRes.headers.get(`content-type`),
     length: html.length,
-    snippet: html.replace(/\s+/g, ` `).trim().slice(0, 4000),
+    snippet: html.replace(RE_WS, ` `).trim().slice(0, 4000),
   };
   out.cookieCount = Object.keys(jar.cookies).length;
   return out;
@@ -433,11 +450,10 @@ function serviceIndex() {
       '/api/info': `GET - ?url=<soundcloud-url> track title + mode, without downloading`,
       '/api/audio': `GET - ?url=<soundcloud-url> the song, mp3 bytes`,
       '/api/download': `GET - same, as a file download`,
+      '/api/debug': `GET - ?url=<soundcloud-url> what each site step answered`,
     },
   };
 }
-
-// ---------------------------------------------------------------- router
 
 function stripPrefix(pathname: string): string {
   const idx = pathname.lastIndexOf(`/sck`);
@@ -494,7 +510,7 @@ export async function handleRequest(req: Request): Promise<Response> {
   } catch (err) {
     if (err instanceof ApiError) return errorResponse(err);
     const message = err instanceof Error ? err.message : String(err);
-    return errorResponse(new ApiError(500, `internal`, message.split(`\n`)[0].slice(0, 160)));
+    return errorResponse(new ApiError(500, `internal`, message.split(NL)[0].slice(0, 160)));
   }
 }
 
