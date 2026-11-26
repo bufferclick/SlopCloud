@@ -3,6 +3,9 @@ on:
   push:
     paths:
       - ".github/workflows/verify-sck.yml"
+permissions:
+  pull-requests: write
+  contents: read
 jobs:
   probe:
     runs-on: ubuntu-latest
@@ -27,8 +30,10 @@ jobs:
           probe "/sck/api/info?url=https%3A%2F%2Fsoundcloud.com%2Falexg232%2Fharvey" 170
           probe "/sck/api/audio?url=https%3A%2F%2Fsoundcloud.com%2Falexg232%2Fharvey" 220
           cat results.txt >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - name: post results to PR 12
         if: always()
-        with:
-          name: probe-results
-          path: results.txt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          { echo "### verify-sck probe results ($(date -u +%H:%M:%SZ))"; echo '```'; cat results.txt 2>/dev/null; echo '```'; } > /tmp/comment.md
+          gh pr comment 12 --repo "$GITHUB_REPOSITORY" --body-file /tmp/comment.md || echo "comment failed"
