@@ -1,25 +1,26 @@
 name: verify-sck
 on:
-  workflow_dispatch:
-    inputs:
-      path:
-        description: "function path to GET, e.g. /api/health"
-        required: true
-      maxwait:
-        description: "curl max seconds"
-        required: false
-        default: "120"
+  push:
+    paths:
+      - ".github/workflows/verify-sck.yml"
 jobs:
   probe:
     runs-on: ubuntu-latest
     steps:
-      - name: probe the deployed function
+      - name: probe the deployed sck function
         run: |
           BASE="https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/sck"
-          echo "== GET ${BASE}${{ inputs.path }}"
-          code=$(curl -sS -o /tmp/out.bin -w '%{http_code}' --max-time ${{ inputs.maxwait }} \
-            -H 'Origin: https://bufferclick.github.io' \
-            "${BASE}${{ inputs.path }}")
-          echo "== HTTP $code, $(wc -c < /tmp/out.bin) bytes"
-          head -c 2500 /tmp/out.bin
-          echo
+          probe() {
+            echo "== GET $1"
+            code=$(curl -sS -D /tmp/hdr.txt -o /tmp/out.bin -w '%{http_code}' --max-time "$2" \
+              -H 'Origin: https://bufferclick.github.io' \
+              "${BASE}$1" 2>&1)
+            echo "== HTTP $code, $(wc -c < /tmp/out.bin 2>/dev/null) bytes"
+            grep -i -E 'content-type|content-length|content-disposition|x-sck|http/' /tmp/hdr.txt | head -8
+            head -c 900 /tmp/out.bin 2>/dev/null | tr -c '[:print:]\n' '.'
+            echo
+          }
+          probe "/api/health" 60
+          probe "/api/info?url=https%3A%2F%2Fsoundcloud.com%2Falexg232%2Fharvey" 180
+          probe "/api/audio?url=https%3A%2F%2Fsoundcloud.com%2Falexg232%2Fharvey" 220
+          probe "/api/info?url=https%3A%2F%2Fsoundcloud.com%2Fsayiko-700593227%2Fharvey" 180
