@@ -586,6 +586,54 @@
       await tx(await db(), 'readwrite', function (store) { store.put(record); });
       return record;
     },
+
+    // KlickAud engine (SCK): an API of klickaud.org, the SoundCloud downloader
+    // website. Last-resort downloader: the site's own Convert -> Download flow.
+    fetchViaSckAndCache: async function (apiBase, soundcloudUrl, opts) {
+      opts = opts || {};
+      var base = (apiBase || '').replace(/\/+$/, '');
+
+      var infoRes = await fetch(base + '/api/info?url=' + encodeURIComponent(soundcloudUrl), { signal: opts.signal || undefined });
+      if (!infoRes.ok) {
+        var errBody = await infoRes.json().catch(function () { return null; });
+        throw new Error((errBody && errBody.error && errBody.error.message) || ('SCK /api/info failed (HTTP ' + infoRes.status + ').'));
+      }
+      var info = await infoRes.json();
+      var id = hashId(soundcloudUrl);
+
+      var audioRes = await fetch(base + '/api/audio?url=' + encodeURIComponent(soundcloudUrl), { signal: opts.signal || undefined });
+      if (!audioRes.ok) {
+        var audioBody = await audioRes.json().catch(function () { return null; });
+        throw new Error((audioBody && audioBody.error && audioBody.error.message) || ('SCK /api/audio failed (HTTP ' + audioRes.status + ').'));
+      }
+      var abuf = new Uint8Array(await audioRes.arrayBuffer());
+      var type = (audioRes.headers.get('Content-Type') || 'audio/mpeg').split(';')[0].trim();
+      var sourceNote = audioRes.headers.get('X-SCK-Source') || '';
+
+      var blob = new Blob([abuf], { type: type });
+      var record = {
+        id: id,
+        title: info.title || 'Untitled',
+        artist: 'Unknown artist',
+        duration: null,
+        artworkUrl: null,
+        sourceUrl: soundcloudUrl,
+        ext: 'mp3',
+        mime: type,
+        size: blob.size,
+        savedAt: Date.now(),
+        note: 'via KlickAud' + (sourceNote ? ' – ' + sourceNote : ''),
+        snip: false,
+      };
+
+      var cache = await audioCache();
+      await cache.put(
+        new Request(cacheKey(id)),
+        new Response(blob, { headers: { 'Content-Type': record.mime, 'X-SlopCloud-Title': encodeURIComponent(record.title) } })
+      );
+      await tx(await db(), 'readwrite', function (store) { store.put(record); });
+      return record;
+    },
   };
 
   self.SlopCloud = SlopCloud;

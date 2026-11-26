@@ -220,6 +220,62 @@ Notes:
 The function is deployed like SSDA (`verify_jwt = false`); source lives in
 `supabase/functions/sca/index.ts`.
 
+## The SCK API (an API of klickaud.org)
+
+SCK is an **API of [klickaud.org](https://www.klickaud.org/en17/)**, the
+SoundCloud downloader website: you give it a SoundCloud URL, it runs the
+site's own flow — paste the URL, press Convert, wait for the download, press
+"DOWNLOAD THE SONG" — and hands you the mp3. The website automation is the
+whole point: CSRF token → `download.php` → the site's worker SSE stream (or
+its instant direct link) → the song bytes.
+
+```
+GET /api/health                 status
+GET /api/info?url=<sc-url>      run the flow, return title + mode (no download)
+GET /api/audio?url=<sc-url>     the song, mp3 bytes
+GET /api/download?url=<sc-url>  same, as a file download
+```
+
+```bash
+SCK=https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/sck
+
+# What does the site call this track?
+curl "$SCK/api/info?url=https://soundcloud.com/alexg232/harvey"
+
+# The song itself
+curl -L "$SCK/api/audio?url=https://soundcloud.com/alexg232/harvey" -o harvey.mp3
+```
+
+Honesty notes, because this one wraps a **third-party service**:
+- Every response carries `X-SCK-Source: klickaud.org (third-party converter)`
+  and `X-SCK-Mode: direct|worker` — you always know the bytes came through
+  klickaud's servers, whose availability and quality are theirs, not ours.
+- Failures are named: `no_token` (site blocking non-browser traffic),
+  `convert_failed` (no link after Convert), `worker_failed` (their worker
+  gave up), `no_result`, `empty_file` (they sometimes serve 0-byte files —
+  we refuse those), `verify_required` (klickaud asked for human/captcha
+  verification — never solved here, named with the captcha vendor), and
+  `bad_url` (SoundCloud links only).
+- klickaud sometimes interposes a "Verify your download" form after Convert.
+  Plain hidden-field forms are continued automatically (the same thing the
+  page's own submit button does); real captchas stop the flow honestly.
+- **Observed 2026-11-26 (site redesign):** klickaud removed its
+  `csrf-token-endpoint.php` and gates Convert behind **Cloudflare Turnstile**
+  for non-browser clients. The API adapts (token is best-effort: endpoint →
+  page scrape → none) and reports `verify_required (turnstile)` when the site
+  demands human verification — it never solves captchas. When the site does
+  serve a download (it may not challenge every client), the full flow works.
+- `GET /api/debug?url=<sc-url>` shows what klickaud actually answered at each
+  step (landing/CSRF/Convert, truncated) — the self-repair view for when the
+  site changes.
+- klickaud works on public SoundCloud tracks; Go+/private/region-locked
+  tracks depend on what their service can prepare. Nothing is DRM-decrypted
+  here either — whatever klickaud refuses, this API refuses.
+- On the site, SCK is the **last-resort save engine** (ssda → sca → sck).
+
+The function is deployed like the others (`verify_jwt = false`); source lives
+in `supabase/functions/sck/index.ts`.
+
 ## Use SlopCloud in your own site
 
 Two integration levels.

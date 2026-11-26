@@ -373,6 +373,10 @@
   var SCA_API_BASE = localStorage.getItem('sca.api') ||
     'https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/sca';
 
+  // SCK - the KlickAud engine: an API of klickaud.org (third-party converter).
+  var SCK_API_BASE = localStorage.getItem('sck.api') ||
+    'https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/sck';
+
   function ytSetStatus(msg, kind) {
     els.ytStatus.textContent = msg || '';
     els.ytStatus.className = 'status' + (kind ? ' ' + kind : '');
@@ -613,10 +617,15 @@
           onProgress: showProgress,
         });
       } catch (err) {
-        // The ssda engine could not save it - try the SCA downloader API
-        // (api-anything recipe chain, mp3 passthrough) before giving up.
+        // The ssda engine could not save it. Try the SCA downloader API
+        // (api-anything recipe chain), then the KlickAud engine (SCK - the
+        // klickaud.org website automated) before giving up.
         record = await SlopCloud.fetchViaScaAndCache(SCA_API_BASE, url, {
           onProgress: showProgress,
+        }).catch(function () {
+          return SlopCloud.fetchViaSckAndCache(SCK_API_BASE, url, {
+            onProgress: showProgress,
+          });
         }).catch(function () { throw err; });
       }
       var saved = 'Saved to cache: ' + record.artist + ' – ' + record.title;

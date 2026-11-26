@@ -1,0 +1,44 @@
+name: verify-sck
+on:
+  push:
+    paths:
+      - ".github/workflows/verify-sck.yml"
+permissions:
+  pull-requests: write
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: probe the deployed functions
+        run: |
+          BASE="https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1"
+          probe() {
+            echo "== GET $1" | tee -a results.txt
+            code=$(curl -sS -D /tmp/hdr.txt -o /tmp/out.bin -w '%{http_code}' --max-time "$2" \
+              -H 'Origin: https://bufferclick.github.io' \
+              "${BASE}$1" 2>/tmp/curlerr.txt) || code="CURL_EXIT_$?_$(head -c 120 /tmp/curlerr.txt)"
+            line="== HTTP $code, $(wc -c < /tmp/out.bin 2>/dev/null || echo 0) bytes"
+            echo "$line" | tee -a results.txt
+            grep -i -E 'content-type|content-length|content-disposition|x-sck|http/' /tmp/hdr.txt 2>/dev/null | head -8 | tee -a results.txt
+            head -c 2000 /tmp/out.bin 2>/dev/null | tr -c '[:print:]\n' '.' | tee -a results.txt
+            echo | tee -a results.txt
+          }
+          probe "/sca/api/health" 45
+          probe "/yta/api/health" 45
+          probe "/sck/api/health" 45
+          probe "/sck/api/debug?url=https%3A%2F%2Fsoundcloud.com%2Falexg232%2Fharvey" 120
+          probe "/sck/api/info?url=https%3A%2F%2Fsoundcloud.com%2Falexg232%2Fharvey" 170
+          probe "/sck/api/audio?url=https%3A%2F%2Fsoundcloud.com%2Falexg232%2Fharvey" 220
+          cat results.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: post results to PR 12
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          { echo "### verify-sck probe results ($(date -u +%H:%M:%SZ))"; echo '```'; cat results.txt 2>/dev/null; echo '```'; } > /tmp/comment.md
+          gh pr comment 12 --repo "$GITHUB_REPOSITORY" --body-file /tmp/comment.md || echo "comment failed"
+
+# trigger 123139
+
+# trigger 124840
