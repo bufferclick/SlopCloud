@@ -36,6 +36,20 @@
     playerSeek: $('player-seek'),
     playerTime: $('player-time'),
     playerClose: $('player-close'),
+    ytSearchForm: $('yt-search-form'),
+    ytSearchInput: $('yt-search-input'),
+    scSearchForm: $('sc-search-form'),
+    scSearchInput: $('sc-search-input'),
+    scSearchResults: $('sc-search-results'),
+    scSearchStatus: $('sc-search-status'),
+    ytResults: $('yt-results'),
+    ytForm: $('yt-form'),
+    ytUrl: $('yt-url-input'),
+    ytSaveBtn: $('yt-save-btn'),
+    ytFileBtn: $('yt-file-btn'),
+    ytProgressWrap: $('yt-progress-wrap'),
+    ytProgressBar: $('yt-progress-bar'),
+    ytStatus: $('yt-status'),
   };
 
   var state = {
@@ -350,19 +364,261 @@
     }
   }
 
+  // ---------- YouTube: search + download to mp3 ----------
+
+  var YT_API_BASE = localStorage.getItem('yta.api') ||
+    'https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/yta';
+
+  // SCA - SoundCloud downloader API built on api-anything's learned recipes.
+  var SCA_API_BASE = localStorage.getItem('sca.api') ||
+    'https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/sca';
+
+  function ytSetStatus(msg, kind) {
+    els.ytStatus.textContent = msg || '';
+    els.ytStatus.className = 'status' + (kind ? ' ' + kind : '');
+  }
+
+  function ytShowProgress(loaded, total) {
+    els.ytProgressWrap.classList.remove('hidden');
+    if (total > 0) {
+      els.ytProgressBar.classList.remove('indeterminate');
+      els.ytProgressBar.style.width = Math.min(100, Math.round((loaded / total) * 100)) + '%';
+    } else {
+      els.ytProgressBar.classList.add('indeterminate');
+      els.ytProgressBar.style.width = '';
+    }
+  }
+
+  function ytHideProgress() {
+    els.ytProgressWrap.classList.add('hidden');
+    els.ytProgressBar.style.width = '0';
+    els.ytProgressBar.classList.remove('indeterminate');
+  }
+
+  function ytBusy(on) {
+    els.ytSaveBtn.disabled = on;
+    els.ytFileBtn.disabled = on;
+    els.ytSearchInput.disabled = on;
+    var btns = els.ytResults.querySelectorAll('button');
+    for (var i = 0; i < btns.length; i++) btns[i].disabled = on;
+  }
+
+  function isYouTubeUrl(url) {
+    return /^https?:\/\/(www\.|m\.|music\.)?(youtube\.com|youtu\.be)\//i.test(url || '');
+  }
+
+  function fmtDuration(sec) {
+    if (sec == null) return '';
+    sec = Math.round(sec);
+    var h = Math.floor(sec / 3600);
+    var m = Math.floor((sec % 3600) / 60);
+    var s = sec % 60;
+    return h > 0
+      ? h + ':' + (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s
+      : m + ':' + (s < 10 ? '0' : '') + s;
+  }
+
+  async function ytSearch(query) {
+    var q = (query || '').trim();
+    if (!q) return;
+    els.ytResults.innerHTML = '';
+    ytBusy(true);
+    ytSetStatus('Searching YouTube…');
+    try {
+      var results = await SlopCloud.searchYouTube(YT_API_BASE, q);
+      if (!results.length) {
+        ytSetStatus('No results for "' + q + '".', 'error');
+        return;
+      }
+      ytSetStatus(results.length + ' results. Save any of them as mp3.', 'ok');
+      for (var i = 0; i < results.length; i++) {
+        var r = results[i];
+        var li = document.createElement('li');
+        li.className = 'yt-result';
+        var img = document.createElement('img');
+        img.src = r.thumbnail_url || '';
+        img.alt = '';
+        img.loading = 'lazy';
+        var meta = document.createElement('div');
+        meta.className = 'yt-meta';
+        var title = document.createElement('div');
+        title.className = 'yt-title';
+        title.textContent = r.title || 'Untitled';
+        var sub = document.createElement('div');
+        sub.className = 'yt-sub';
+        sub.textContent = (r.author || '') + (r.duration_s ? ' · ' + fmtDuration(r.duration_s) : '');
+        meta.appendChild(title);
+        meta.appendChild(sub);
+        var btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'btn primary small';
+        btn.textContent = 'Save as mp3';
+        btn.addEventListener('click', function (vid) {
+          return function () { ytSave('https://www.youtube.com/watch?v=' + vid, false); };
+        }(r.video_id));
+        li.appendChild(img);
+        li.appendChild(meta);
+        li.appendChild(btn);
+        els.ytResults.appendChild(li);
+      }
+    } catch (e) {
+      ytSetStatus(e.message, 'error');
+    } finally {
+      ytBusy(false);
+    }
+  }
+
+  // ---------- SoundCloud search (SCA) + save via the normal flow ----------
+
+  function scSetStatus(msg, kind) {
+    els.scSearchStatus.textContent = msg || '';
+    els.scSearchStatus.className = 'status' + (kind ? ' ' + kind : '');
+  }
+
+  function scBusy(on) {
+    els.scSearchForm.querySelectorAll('button, input').forEach(function (el) { el.disabled = on; });
+  }
+
+  async function scSearch(query) {
+    var q = (query || '').trim();
+    if (!q) return;
+    els.scSearchResults.innerHTML = '';
+    scBusy(true);
+    scSetStatus('Searching SoundCloud…');
+    try {
+      var results = await SlopCloud.searchSoundCloud(SCA_API_BASE, q);
+      if (!results.length) {
+        scSetStatus('No results for "' + q + '".', 'error');
+        return;
+      }
+      scSetStatus(results.length + ' results. Save any of them through the normal save flow.', 'ok');
+      for (var i = 0; i < results.length; i++) {
+        (function (r) {
+          var li = document.createElement('li');
+          li.className = 'yt-result';
+          var img = document.createElement('img');
+          img.src = r.artwork || '';
+          img.alt = '';
+          img.loading = 'lazy';
+          var meta = document.createElement('div');
+          meta.className = 'yt-meta';
+          var title = document.createElement('div');
+          title.className = 'yt-title';
+          title.textContent = r.title || 'Untitled';
+          var sub = document.createElement('div');
+          sub.className = 'yt-sub';
+          sub.textContent = (r.artist || '') + (r.durationMs ? ' · ' + fmtDuration(Math.round(r.durationMs / 1000)) : '');
+          meta.appendChild(title);
+          meta.appendChild(sub);
+          var btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'btn primary small';
+          btn.textContent = 'Save';
+          btn.addEventListener('click', function () {
+            els.url.value = r.permalink || '';
+            saveToCache();
+          });
+          li.appendChild(img);
+          li.appendChild(meta);
+          li.appendChild(btn);
+          els.scSearchResults.appendChild(li);
+        })(results[i]);
+      }
+    } catch (e) {
+      scSetStatus(e.message, 'error');
+    } finally {
+      scBusy(false);
+    }
+  }
+
+  els.scSearchForm.addEventListener('submit', function (e) {
+    e.preventDefault();
+    var q = els.scSearchInput.value.trim();
+    if (!q) return;
+    scSearch(q);
+  });
+
+  async function ytSave(videoUrl, toFiles) {
+    var url = (videoUrl || '').trim();
+    if (!url) {
+      ytSetStatus('Paste a YouTube link (or search above) first.', 'error');
+      return;
+    }
+    if (!isYouTubeUrl(url)) {
+      ytSetStatus('That does not look like a YouTube link.', 'error');
+      return;
+    }
+    ytBusy(true);
+    ytSetStatus('Fetching video info…');
+    ytShowProgress(0, 0);
+    try {
+      var record = await SlopCloud.fetchYouTubeAndCache(YT_API_BASE, url, {
+        onProgress: ytShowProgress,
+      });
+      var saved = 'Saved to cache: ' + record.artist + ' – ' + record.title;
+      if (record.note) saved += ' (' + record.note + ')';
+      ytSetStatus(saved, 'ok');
+      els.ytUrl.value = '';
+      if (toFiles) {
+        var blob = await SlopCloud.getSongBlob(record.id);
+        saveBlobToFile(blob, sanitizeName(record.artist + ' - ' + record.title) + '.mp3');
+      }
+      await reloadSongs();
+    } catch (e) {
+      ytSetStatus(e.message, 'error');
+    } finally {
+      ytBusy(false);
+      ytHideProgress();
+    }
+  }
+
+  els.ytSearchForm.addEventListener('submit', function (e) {
+    e.preventDefault();
+    var q = els.ytSearchInput.value.trim();
+    if (isYouTubeUrl(q)) {
+      ytSave(q, false);
+      return;
+    }
+    ytSearch(q);
+  });
+
+  els.ytForm.addEventListener('submit', function (e) {
+    e.preventDefault();
+    ytSave(els.ytUrl.value, false);
+  });
+
+  els.ytFileBtn.addEventListener('click', function () {
+    ytSave(els.ytUrl.value, true);
+  });
+
   // ---------- add / download flows ----------
 
   async function saveToCache() {
     var url = els.url.value.trim();
     if (!url) return;
+    if (isYouTubeUrl(url)) {
+      // YouTube links pasted into the SoundCloud box go to the YouTube flow.
+      await ytSave(url, false);
+      els.url.value = '';
+      return;
+    }
     busy(true);
     setStatus('Fetching track info…');
     showProgress(0, 0);
     try {
-      var record = await SlopCloud.fetchAndCache(API_BASE, url, {
-        format: els.format.value,
-        onProgress: showProgress,
-      });
+      var record;
+      try {
+        record = await SlopCloud.fetchAndCache(API_BASE, url, {
+          format: els.format.value,
+          onProgress: showProgress,
+        });
+      } catch (err) {
+        // The ssda engine could not save it - try the SCA downloader API
+        // (api-anything recipe chain, mp3 passthrough) before giving up.
+        record = await SlopCloud.fetchViaScaAndCache(SCA_API_BASE, url, {
+          onProgress: showProgress,
+        }).catch(function () { throw err; });
+      }
       var saved = 'Saved to cache: ' + record.artist + ' – ' + record.title;
       if (record.note) saved += ' (' + record.note + ')';
       if (record.snip) saved += ' – preview-only track, may be short';

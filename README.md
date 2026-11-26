@@ -105,6 +105,121 @@ The function is deployed in the Supabase project `SlopCloud`
 (`supabase functions deploy ssda --no-verify-jwt`) or through the connected
 Supabase app.
 
+## The YTA API (YouTube)
+
+```
+GET /api/health                              status
+GET /api/search?q=<query>                    search YouTube (JSON results)
+GET /api/info?url=<youtube-link>             video metadata (JSON)
+GET /api/audio?url=<link>&format=mp3|m4a     audio bytes (mp3 is converted)
+GET /api/download?url=<link>                 audio bytes as a file download
+```
+
+Base URL (live, CORS open):
+
+```
+https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/yta
+```
+
+Quick try:
+
+```sh
+curl "https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/yta/api/search?q=lofi"
+curl -o video.mp3 "https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/yta/api/audio?url=https://www.youtube.com/watch?v=jNQXAC9IVRw"
+```
+
+- `url` must be a YouTube link (`youtube.com/watch?v=`, `youtu.be/`,
+  `/shorts/`, `/embed/`, `/live/`). `format=mp3` (default) converts the
+  video's highest-quality AAC audio to 320 kbps mp3; `format=m4a` passes
+  YouTube's own AAC stream through untouched.
+- Long videos convert in chunks exactly like SSDA (`&chunk=info|N|all`,
+  `413 chunked_conversion_required` with the recipe; the site stitches them
+  automatically). Converted chunks, whole files and the raw source are stored
+  in the server-side cache (`X-YTA-Cache: hit` on repeats), so the second
+  download of the same video is instant.
+- When YouTube only offers ciphered/protected streams for a video (they
+  rotate anti-bot profiles per region), the API answers honestly with
+  `415 streams_locked` instead of guessing — nothing is DRM-decrypted here.
+  Age-restricted and members-only videos answer `403 not_available`.
+- Errors are JSON: `{"error": {"code": "...", "message": "..."}}`.
+
+The function is deployed like SSDA (`verify_jwt = false`); source lives in
+`supabase/functions/yta/index.ts`.
+
+## The SCA API (SoundCloud downloader, api-anything recipes)
+
+SCA is a SoundCloud downloader API built on the **api-anything**
+([goodnight000/api-anything](https://github.com/goodnight000/api-anything))
+learned-recipe format: "turn any website into an API your agent can call".
+The recipes live in `sites/soundcloud.json` (the exact schema api-anything's
+learner produces — ops, slots, response picks) and `supabase/functions/sca`
+is the tier-1 replay runner for them plus a downloader built from their
+chain: **resolveTrack → pick a progressive transcoding → getStreamUrl → GET
+the returned URL**, one request per op exactly like api-anything's op
+granularity. The downloader takes three honest paths, in order: a
+**progressive mp3 is passed through unconverted**; a plain (unencrypted) HLS
+track is **assembled and converted to mp3 by our own ssda engine** and
+streamed through (long tracks are chunked and stitched server-side); and
+**encrypted-HLS-only tracks stay locked** — `403 encrypted_stream`, no keys,
+no CDM, no signed-in session. Go+/blocked tracks are refused the same way.
+As of late 2026 SoundCloud serves many tracks as encrypted
+`cbc/ctr-encrypted-hls` only; those are refused by name rather than
+circumvented.
+
+The same recipes are upstream-contribution ready: `sites/soundcloud.json`
+follows the site-file schema of api-anything's own `sites/` catalog and can
+be contributed there.
+
+```
+GET /api/health                     status
+GET /api/ops                        the learned operations + parameters
+GET /api/call?op=<op>&<param>=...   run one learned operation (api-anything style)
+GET /api/search?q=<query>           search public tracks
+GET /api/info?url=<track-url>       track record + transcodings
+GET /api/audio?url=<track-url>      the audio bytes (mp3 passthrough)
+GET /api/download?url=<track-url>   same, as a file download
+```
+
+```bash
+SCA=https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/sca
+
+# What the API knows (the learned operations)
+curl "$SCA/api/ops"
+
+# Search, then save through the site (or read the picked fields here)
+curl "$SCA/api/search?q=harvey"
+
+# Track record with the transcodings a downloader picks from
+curl "$SCA/api/info?url=https://soundcloud.com/alexg232/harvey"
+
+# The downloader itself - the mp3 bytes
+curl -L "$SCA/api/audio?url=https://soundcloud.com/alexg232/harvey" -o harvey.mp3
+
+# Or replay any learned operation directly, api-anything style
+curl "$SCA/api/call?op=searchTracks&q=harvey"
+```
+
+Notes:
+- The `client_id` SoundCloud ships in its own JS (api-anything keeps such
+  values literal as `public` constants) is refreshed automatically by the
+  runner: it reads the site's asset bundles and rotates pooled ids, the same
+  self-healing idea api-anything's repair step exists for.
+- Honest refusals, no silent substitution: blocked/Go+ tracks answer
+  `403 restricted`; encrypted-HLS-only tracks answer `403 encrypted_stream`
+  (named protocols, "no keys, no CDM"); non-mp3 progressive files stay their
+  own format with an explicit label; preview (SNIP) tracks download labeled
+  `preview/snip`.
+- Every audio response carries `X-SCA-Source` (exactly what produced the
+  bytes: `soundcloud progressive mp3 (passthrough)`, `hls assembled +
+  converted to mp3 by the ssda engine`, …) and `X-SCA-Extension`.
+- The site's SoundCloud search box is powered by this API; saves go through
+  the normal SSDA flow with SCA as the automatic fallback engine.
+- Errors are JSON: `{"error": {"code": "...", "message": "..."}}`.
+- Tests: `node tools/test-sca.mjs` (all mocked, no network).
+
+The function is deployed like SSDA (`verify_jwt = false`); source lives in
+`supabase/functions/sca/index.ts`.
+
 ## Use SlopCloud in your own site
 
 Two integration levels.
@@ -178,17 +293,24 @@ python3 -m http.server 8000 --directory site
 ## Tests
 
 ```sh
-npm install          # mirrors the function's npm: imports for Node
-node tools/test-ssda.mjs
+npm install          # mirrors the functions' npm: imports for Node
+node tools/test-ssda.mjs   # SoundCloud pipeline (122 tests)
+node tools/test-yta.mjs    # YouTube pipeline (59 tests)
+node tools/test-sca.mjs    # SCA recipe replay + downloader API (24 tests)
 ```
 
-66 tests covering routing, format selection, format conversion (real
+The SSDA suite covers routing, format selection, format conversion (real
 decode/re-encode through wasm codecs, including styp-headed fMP4 HLS),
 HLS assembly, container validation, DRM handling, the legacy-stream and
 official-download fallbacks, explicit-format fidelity, short-link expansion,
-resolve-body validation, error shapes, CORS, and resilience (challenge-page
-retries, flaky upstream, oEmbed fallback) — all against a mocked SoundCloud,
-no network needed.
+resolve-body validation, error shapes, CORS, resilience (challenge-page
+retries, flaky upstream, oEmbed fallback), Retry-After backoff, the client_id
+pool, and the server-side cache with `chunk=all` assembly. The YTA suite
+covers search parsing, player/format selection across Innertube clients,
+one-shot and chunked mp3 conversion of a real AAC fixture, m4a passthrough,
+the server-side cache (miss→hit, chunk=all byte-equality), and honest errors
+(ciphered streams, age restrictions, opus-only videos, oversized sources) —
+all against mocked upstreams, no network needed.
 
 ## Notes
 

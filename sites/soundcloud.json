@@ -1,0 +1,309 @@
+{
+  "name": "soundcloud",
+  "displayName": "SoundCloud",
+  "baseUrl": "https://soundcloud.com",
+  "description": "SoundCloud downloader reads, logged out: search public tracks, resolve a track page, and resolve a transcoding to its direct stream URL (the chain a downloader needs). Public tracks only - Go+/restricted tracks stay restricted. client_id is the public constant SoundCloud ships in its own JS; callers refresh it from the site's asset bundles (the SlopCloud sca runner does this automatically).",
+  "operations": [
+    {
+      "name": "searchTracks",
+      "description": "Search the first page of public tracks by keyword, from the same api-v2 search call the SoundCloud web app makes.",
+      "request": {
+        "method": "GET",
+        "url": "https://api-v2.soundcloud.com/search/tracks?q=%7Bq%7D&client_id=%7Bclient_id%7D&limit=10&offset=0&linked_partitioning=1&app_locale=en",
+        "headers": {
+          "accept": "application/json",
+          "accept-language": "en-US,en;q=0.9",
+          "origin": "https://soundcloud.com",
+          "referer": "https://soundcloud.com/search?q={q}",
+          "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
+        }
+      },
+      "slots": [
+        { "param": "q", "at": ["query:q"] },
+        { "param": "client_id", "at": ["query:client_id"] }
+      ],
+      "volatile": [],
+      "trigger": {
+        "url": "https://api-v2.soundcloud.com/search/tracks?q={q}&client_id={client_id}&limit=10&offset=0&linked_partitioning=1&app_locale=en"
+      },
+      "match": {
+        "method": "GET",
+        "host": "api-v2.soundcloud.com",
+        "path": "/search/tracks"
+      },
+      "response": {
+        "format": "json",
+        "contentType": "application/json",
+        "extract": "collection",
+        "key": "id",
+        "pick": [
+          "id=id",
+          "title=title",
+          "artist=user.username",
+          "durationMs=duration",
+          "permalink=permalink_url",
+          "artwork=artwork_url",
+          "genre=genre"
+        ]
+      },
+      "params": [
+        {
+          "name": "q",
+          "type": "string",
+          "required": true,
+          "description": "Search keywords, same as the search box on soundcloud.com.",
+          "example": "harvey"
+        },
+        {
+          "name": "client_id",
+          "type": "string",
+          "required": true,
+          "description": "SoundCloud web client id. A public constant the site ships in its own JS (api-anything keeps such values literal via 'public'); refresh it from the site's sndcdn.com asset bundles when it stops answering.",
+          "example": "iZIs9mchVcX5lhVRyQGGAYlNPVldzAoX"
+        }
+      ],
+      "public": ["client_id"],
+      "readOnly": true,
+      "minTier": 1,
+      "learnedLoggedIn": false,
+      "checks": [
+        {
+          "args": { "q": "harvey" },
+          "expect": "result",
+          "purpose": "A public keyword query returns track results"
+        }
+      ]
+    },
+    {
+      "name": "resolveTrack",
+      "description": "Resolve a SoundCloud track page URL to its track record: identity, artwork, availability policy, and the media transcodings a downloader picks a stream from.",
+      "request": {
+        "method": "GET",
+        "url": "https://api-v2.soundcloud.com/resolve?url=%7Burl%7D&client_id=%7Bclient_id%7D",
+        "headers": {
+          "accept": "application/json",
+          "accept-language": "en-US,en;q=0.9",
+          "origin": "https://soundcloud.com",
+          "referer": "https://soundcloud.com/",
+          "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
+        }
+      },
+      "slots": [
+        { "param": "url", "at": ["query:url"] },
+        { "param": "client_id", "at": ["query:client_id"] }
+      ],
+      "volatile": [],
+      "trigger": {
+        "url": "https://api-v2.soundcloud.com/resolve?url={url}&client_id={client_id}"
+      },
+      "match": {
+        "method": "GET",
+        "host": "api-v2.soundcloud.com",
+        "path": "/resolve"
+      },
+      "response": {
+        "format": "json",
+        "contentType": "application/json",
+        "extract": ".",
+        "key": "id",
+        "pick": [
+          "id=id",
+          "title=title",
+          "artist=user.username",
+          "durationMs=duration",
+          "artwork=artwork_url",
+          "permalink=permalink_url",
+          "policy=policy",
+          "trackAuthorization=track_authorization",
+          "transcodings=media.transcodings"
+        ]
+      },
+      "params": [
+        {
+          "name": "url",
+          "type": "string",
+          "required": true,
+          "description": "Public SoundCloud track page URL (soundcloud.com/artist/track).",
+          "example": "https://soundcloud.com/alexg232/harvey"
+        },
+        {
+          "name": "client_id",
+          "type": "string",
+          "required": true,
+          "description": "SoundCloud web client id (public constant from the site's JS).",
+          "example": "iZIs9mchVcX5lhVRyQGGAYlNPVldzAoX"
+        }
+      ],
+      "public": ["client_id"],
+      "readOnly": true,
+      "minTier": 1,
+      "learnedLoggedIn": false,
+      "checks": [
+        {
+          "args": { "url": "https://soundcloud.com/alexg232/harvey" },
+          "expect": "result",
+          "purpose": "A public track page resolves to its track record"
+        }
+      ]
+    },
+    {
+      "name": "getTrack",
+      "description": "Read a track record by numeric id: same record resolveTrack returns, for when a search result already carries the id.",
+      "request": {
+        "method": "GET",
+        "url": "https://api-v2.soundcloud.com/tracks/%7BtrackId%7D?client_id=%7Bclient_id%7D",
+        "headers": {
+          "accept": "application/json",
+          "accept-language": "en-US,en;q=0.9",
+          "origin": "https://soundcloud.com",
+          "referer": "https://soundcloud.com/",
+          "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
+        }
+      },
+      "slots": [
+        { "param": "trackId", "at": ["path:1"] },
+        { "param": "client_id", "at": ["query:client_id"] }
+      ],
+      "volatile": [],
+      "trigger": {
+        "url": "https://api-v2.soundcloud.com/tracks/{trackId}?client_id={client_id}"
+      },
+      "match": {
+        "method": "GET",
+        "host": "api-v2.soundcloud.com",
+        "path": "/tracks/*"
+      },
+      "response": {
+        "format": "json",
+        "contentType": "application/json",
+        "extract": ".",
+        "key": "id",
+        "pick": [
+          "id=id",
+          "title=title",
+          "artist=user.username",
+          "durationMs=duration",
+          "artwork=artwork_url",
+          "permalink=permalink_url",
+          "policy=policy",
+          "trackAuthorization=track_authorization",
+          "transcodings=media.transcodings"
+        ]
+      },
+      "params": [
+        {
+          "name": "trackId",
+          "type": "number",
+          "required": true,
+          "description": "Numeric track id.",
+          "example": "340501365"
+        },
+        {
+          "name": "client_id",
+          "type": "string",
+          "required": true,
+          "description": "SoundCloud web client id (public constant from the site's JS).",
+          "example": "iZIs9mchVcX5lhVRyQGGAYlNPVldzAoX"
+        }
+      ],
+      "public": ["client_id"],
+      "readOnly": true,
+      "minTier": 1,
+      "learnedLoggedIn": false,
+      "checks": [
+        {
+          "args": { "trackId": "340501365" },
+          "expect": "result",
+          "purpose": "A public track id returns its record"
+        }
+      ]
+    },
+    {
+      "name": "getStreamUrl",
+      "description": "Turn one media transcoding of a track (from resolveTrack's transcodings[].url) into its direct stream URL. Chain: resolveTrack -> pick a progressive transcoding -> getStreamUrl -> GET the returned url for the audio bytes. One request, one value - the chain lives in the caller, per api-anything's op granularity.",
+      "request": {
+        "method": "GET",
+        "url": "https://api-v2.soundcloud.com/media/soundcloud:tracks:%7BtrackId%7D/%7BtranscodingKey%7D/stream/https?client_id=%7Bclient_id%7D&track_authorization=%7Btrack_authorization%7D",
+        "headers": {
+          "accept": "application/json",
+          "accept-language": "en-US,en;q=0.9",
+          "origin": "https://soundcloud.com",
+          "referer": "https://soundcloud.com/",
+          "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
+        }
+      },
+      "slots": [
+        {
+          "param": "trackId",
+          "at": ["path:1"],
+          "template": "soundcloud:tracks:{trackId}",
+          "escape": "url"
+        },
+        { "param": "transcodingKey", "at": ["path:2"], "escape": "url" },
+        { "param": "client_id", "at": ["query:client_id"] },
+        { "param": "track_authorization", "at": ["query:track_authorization"] }
+      ],
+      "volatile": [],
+      "trigger": {
+        "url": "https://api-v2.soundcloud.com/media/soundcloud:tracks:{trackId}/{transcodingKey}/stream/https?client_id={client_id}&track_authorization={track_authorization}"
+      },
+      "match": {
+        "method": "GET",
+        "host": "api-v2.soundcloud.com",
+        "path": "/media/*"
+      },
+      "response": {
+        "format": "json",
+        "contentType": "application/json",
+        "extract": ".",
+        "key": "url",
+        "pick": ["url=url"]
+      },
+      "params": [
+        {
+          "name": "trackId",
+          "type": "number",
+          "required": true,
+          "description": "Numeric track id from resolveTrack.",
+          "example": "340501365"
+        },
+        {
+          "name": "transcodingKey",
+          "type": "string",
+          "required": true,
+          "description": "The key path segment of a transcoding URL from resolveTrack's transcodings[].url (the segment between /media/soundcloud:tracks:<id>/ and /stream/).",
+          "example": "1a2b3c4d-5e6f-4a8b-9c0d-1234567890ab"
+        },
+        {
+          "name": "client_id",
+          "type": "string",
+          "required": true,
+          "description": "SoundCloud web client id (public constant from the site's JS).",
+          "example": "iZIs9mchVcX5lhVRyQGGAYlNPVldzAoX"
+        },
+        {
+          "name": "track_authorization",
+          "type": "string",
+          "required": true,
+          "description": "Per-track authorization token from resolveTrack's trackAuthorization.",
+          "example": "eyJhbGciOiJIUzI1NiJ9.example"
+        }
+      ],
+      "public": ["client_id"],
+      "readOnly": true,
+      "minTier": 1,
+      "learnedLoggedIn": false,
+      "checks": [
+        {
+          "args": {
+            "trackId": "340501365",
+            "transcodingKey": "from-resolveTrack",
+            "track_authorization": "from-resolveTrack"
+          },
+          "expect": "result",
+          "purpose": "A transcoding of a public track resolves to a direct stream URL"
+        }
+      ]
+    }
+  ]
+}

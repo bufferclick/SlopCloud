@@ -11,11 +11,52 @@
 
   <header>
     <h1>SlopCloud</h1>
-    <p class="sub">SoundCloud song cache and player. Songs are stored in this site's browser cache.</p>
+    <p class="sub">YouTube &amp; SoundCloud to mp3. Songs are stored in this site's browser cache.</p>
   </header>
 
+  <section class="card" aria-labelledby="yt-h">
+    <h2 id="yt-h">YouTube to mp3</h2>
+    <form id="yt-search-form">
+      <label for="yt-search-input">Search YouTube</label>
+      <div class="row">
+        <input id="yt-search-input" type="search" spellcheck="false"
+               placeholder="song or artist — or paste a youtube.com link">
+        <button type="submit" id="yt-search-btn" class="btn primary">Search</button>
+      </div>
+    </form>
+    <ul id="yt-results" class="yt-results"></ul>
+    <form id="yt-form">
+      <label for="yt-url-input">Or paste a YouTube link</label>
+      <div class="row">
+        <input id="yt-url-input" type="url" inputmode="url" spellcheck="false"
+               placeholder="https://www.youtube.com/watch?v=…">
+      </div>
+      <div class="row controls">
+        <p class="muted">High quality audio, saved as 320 kbps mp3.</p>
+        <div class="btn-group">
+          <button type="submit" id="yt-save-btn" class="btn primary">Save to cache</button>
+          <button type="button" id="yt-file-btn" class="btn">Download mp3 to files</button>
+        </div>
+      </div>
+    </form>
+    <div id="yt-progress-wrap" class="progress-wrap hidden">
+      <div id="yt-progress-bar" class="progress-bar"></div>
+    </div>
+    <p id="yt-status" class="status" role="status"></p>
+  </section>
+
   <section class="card" aria-labelledby="add-h">
-    <h2 id="add-h">Add a song</h2>
+    <h2 id="add-h">Add a SoundCloud song</h2>
+    <form id="sc-search-form">
+      <label for="sc-search-input">Search SoundCloud</label>
+      <div class="row">
+        <input id="sc-search-input" type="search" spellcheck="false"
+               placeholder="song or artist — or paste a soundcloud.com link">
+        <button type="submit" id="sc-search-btn" class="btn primary">Search</button>
+      </div>
+    </form>
+    <p id="sc-search-status" class="status" role="status"></p>
+    <ul id="sc-search-results" class="yt-results"></ul>
     <form id="add-form">
       <label for="url-input">SoundCloud link</label>
       <div class="row">
