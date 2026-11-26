@@ -259,6 +259,12 @@ Honesty notes, because this one wraps a **third-party service**:
 - klickaud sometimes interposes a "Verify your download" form after Convert.
   Plain hidden-field forms are continued automatically (the same thing the
   page's own submit button does); real captchas stop the flow honestly.
+- **Observed 2026-11-26 (site redesign):** klickaud removed its
+  `csrf-token-endpoint.php` and gates Convert behind **Cloudflare Turnstile**
+  for non-browser clients. The API adapts (token is best-effort: endpoint →
+  page scrape → none) and reports `verify_required (turnstile)` when the site
+  demands human verification — it never solves captchas. When the site does
+  serve a download (it may not challenge every client), the full flow works.
 - `GET /api/debug?url=<sc-url>` shows what klickaud actually answered at each
   step (landing/CSRF/Convert, truncated) — the self-repair view for when the
   site changes.
