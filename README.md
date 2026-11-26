@@ -176,7 +176,7 @@ GET /api/ops                        the learned operations + parameters
 GET /api/call?op=<op>&<param>=...   run one learned operation (api-anything style)
 GET /api/search?q=<query>           search public tracks
 GET /api/info?url=<track-url>       track record + transcodings
-GET /api/audio?url=<track-url>      the audio bytes (mp3 passthrough)
+GET /api/audio?url=<track-url>      the audio bytes (mp3: passthrough or ssda conversion)
 GET /api/download?url=<track-url>   same, as a file download
 ```
 
@@ -296,7 +296,10 @@ python3 -m http.server 8000 --directory site
 npm install          # mirrors the functions' npm: imports for Node
 node tools/test-ssda.mjs   # SoundCloud pipeline (122 tests)
 node tools/test-yta.mjs    # YouTube pipeline (59 tests)
-node tools/test-sca.mjs    # SCA recipe replay + downloader API (24 tests)
+node tools/test-sca.mjs    # SCA recipe replay + downloader API (29 tests)
+=======
+node tools/test-yta.mjs    # YouTube pipeline (55 tests)
+>>>>>>> origin/main
 ```
 
 The SSDA suite covers routing, format selection, format conversion (real
