@@ -68,6 +68,8 @@ const RE_HIDDEN_INPUT = rx(`<input[^>]*type=${qClass()}hidden${qClass()}[^>]*>`,
 const RE_INPUT_NAME = rx(`name=${qClass()}([^${DQ}${SQ}]+)${qClass()}`);
 const RE_INPUT_VALUE = rx(`value=${qClass()}([^${DQ}${SQ}]*)${qClass()}`);
 const RE_CSRF_JSON = rx(`${DQ}csrf_token${DQ}${BS}s*:${BS}s*${DQ}([^${DQ}]+)${DQ}`);
+const RE_CSRF_INPUT_A = rx(`name=${qClass()}csrf_token${qClass()}[^>]*value=${qClass()}([^${DQ}${SQ}]*)${qClass()}`);
+const RE_CSRF_INPUT_B = rx(`value=${qClass()}([^${DQ}${SQ}]*)${qClass()}[^>]*name=${qClass()}csrf_token${qClass()}`);
 const RE_SSE_DATA = rx(`^data:${BS}s*`);
 const RE_FILENAME_BAD = rx(`[${BS}${BS}/:*?${DQ}<>|]`, `g`);
 const RE_NON_ASCII = rx(`[^${BS}x20-${BS}x7e]`, `g`);
@@ -134,6 +136,11 @@ function assertSoundcloudUrl(url: string): void {
   }
 }
 
+function scrapeCsrf(html: string): string {
+  const m = html.match(RE_CSRF_INPUT_A) || html.match(RE_CSRF_INPUT_B);
+  return (m && m[1]) || ``;
+}
+
 async function kfetch(jar: Jar, url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
   const headers = new Headers(init.headers || {});
   headers.set(`User-Agent`, UA);
@@ -161,24 +168,25 @@ export async function convert(soundcloudUrl: string): Promise<Converted> {
   assertSoundcloudUrl(soundcloudUrl);
   const jar = new Jar();
 
+  let landHtml = ``;
   try {
-    await kfetch(jar, `${BASE}/en17/`, {
+    const landRes = await kfetch(jar, `${BASE}/en17/`, {
       headers: { Accept: `text/html,application/xhtml+xml` },
     }, 15000);
+    landHtml = await landRes.text();
   } catch { /* warm-up only; the steps below report real failures */ }
 
-  const tokenRes = await kfetch(jar, `${BASE}/csrf-token-endpoint.php`, {
-    headers: { Referer: `${BASE}/en17/`, Accept: `application/json` },
-  }, 15000);
-  const tokenBody = await tokenRes.json().catch(() => null);
-  const csrf = tokenBody && tokenBody.csrf_token;
-  if (!tokenRes.ok || !csrf) {
-    throw new ApiError(
-      502,
-      `no_token`,
-      `klickaud.org did not issue a CSRF token - the site may be updating or blocking non-browser traffic.`,
-    );
-  }
+  let csrf = scrapeCsrf(landHtml);
+  try {
+    const tokenRes = await kfetch(jar, `${BASE}/csrf-token-endpoint.php`, {
+      headers: { Referer: `${BASE}/en17/`, Accept: `application/json` },
+    }, 15000);
+    const tokenText = await tokenRes.text();
+    if (tokenRes.ok) {
+      const m = tokenText.match(RE_CSRF_JSON);
+      csrf = (m && m[1]) || csrf;
+    }
+  } catch { /* the token endpoint is optional since the site's 2026-11 redesign */ }
 
   const form = new URLSearchParams();
   form.append(`value`, soundcloudUrl);
@@ -192,6 +200,14 @@ export async function convert(soundcloudUrl: string): Promise<Converted> {
     },
     body: form.toString(),
   }, 30000);
+  if ((postRes.status === 403 || postRes.status === 401) && !csrf) {
+    throw new ApiError(
+      502,
+      `no_token`,
+      `klickaud.org refused the Convert request and no CSRF token was available - ` +
+        `the site may be updating or blocking non-browser traffic.`,
+    );
+  }
   const firstHtml = await postRes.text();
   const html = await continueThroughVerify(jar, soundcloudUrl, csrf, postRes.status, firstHtml);
   const downloadMode = (html.match(RE_DOWNLOAD_MODE) || [])[1] || ``;
@@ -415,7 +431,7 @@ async function debugFlow(soundcloudUrl: string): Promise<unknown> {
   const tokenText = await tokenRes.text();
   out.csrf = { status: tokenRes.status, snippet: tokenText.slice(0, 300) };
 
-  const csrf = (tokenText.match(RE_CSRF_JSON) || [])[1] || ``;
+  const csrf = (tokenText.match(RE_CSRF_JSON) || [])[1] || scrapeCsrf(landHtml) || ``;
   const form = new URLSearchParams();
   form.append(`value`, soundcloudUrl);
   form.append(`csrf_token`, csrf);
@@ -429,11 +445,31 @@ async function debugFlow(soundcloudUrl: string): Promise<unknown> {
     body: form.toString(),
   }, 30000);
   const html = await postRes.text();
+  const signals: Record<string, unknown> = {};
+  for (const [key, re] of [
+    [`downloadMode`, RE_DOWNLOAD_MODE],
+    [`directDownloadUrl`, RE_DIRECT_URL],
+    [`defaultFileName`, RE_FILE_NAME],
+    [`sseGrant`, RE_SSE_GRANT],
+  ] as const) {
+    const m = html.match(re);
+    signals[key] = m ? m[1] : null;
+  }
+  signals.hasVerifyForm = RE_VERIFY_FORM.test(html);
+  signals.captchaMarkers = CAPTCHA_MARKERS.filter((c) => html.toLowerCase().includes(c));
+  signals.scrapedCsrf = scrapeCsrf(html) || null;
+  const idx = html.indexOf(`downloadMode`);
+  signals.aroundDownloadMode = idx >= 0 ? html.slice(Math.max(0, idx - 150), idx + 250) : null;
+  const fidx = html.search(RE_VERIFY_FORM);
+  signals.aroundForm = fidx >= 0 ? html.slice(Math.max(0, fidx - 100), fidx + 500) : null;
+  const tidx = html.indexOf(`<title`);
+  signals.title = tidx >= 0 ? html.slice(tidx, tidx + 120) : null;
   out.convert = {
     status: postRes.status,
     contentType: postRes.headers.get(`content-type`),
     length: html.length,
-    snippet: html.replace(RE_WS, ` `).trim().slice(0, 4000),
+    signals,
+    snippet: html.replace(RE_WS, ` `).trim().slice(0, 1500),
   };
   out.cookieCount = Object.keys(jar.cookies).length;
   return out;

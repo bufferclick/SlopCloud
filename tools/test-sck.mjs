@@ -276,6 +276,30 @@ test("CSRF failure is honest", async () => {
   }
 });
 
+test("site redesigned: token endpoint gone (404) but Convert works without a token", async () => {
+  const saved = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const u = new URL(String(input));
+    if (u.pathname === "/csrf-token-endpoint.php") return new Response("Not found", { status: 404 });
+    if (u.pathname === "/download.php") {
+      return new Response(
+        convertHtml("direct", { direct: "https://media.test/dl/track.mp3", file: "Harvey_KLICKAUD.mp3" }),
+        { status: 200, headers: { "content-type": "text/html" } },
+      );
+    }
+    return saved(input, init);
+  };
+  try {
+    const r = await app("/api/info?url=https://soundcloud.com/alexg232/harvey-direct");
+    eq(r.status, 200);
+    const body = await r.json();
+    eq(body.mode, "direct");
+    eq(body.title, "Harvey");
+  } finally {
+    globalThis.fetch = saved;
+  }
+});
+
 test("empty files are refused, not served", async () => {
   const saved = globalThis.fetch;
   globalThis.fetch = async (input, init) => {
