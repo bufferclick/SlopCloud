@@ -7,20 +7,28 @@ jobs:
   probe:
     runs-on: ubuntu-latest
     steps:
-      - name: probe the deployed sck function
+      - name: probe the deployed functions
         run: |
-          BASE="https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1/sck"
+          BASE="https://zfshvxknthgzlgzulpuq.supabase.co/functions/v1"
           probe() {
-            echo "== GET $1"
+            echo "== GET $1" | tee -a results.txt
             code=$(curl -sS -D /tmp/hdr.txt -o /tmp/out.bin -w '%{http_code}' --max-time "$2" \
               -H 'Origin: https://bufferclick.github.io' \
-              "${BASE}$1" 2>&1)
-            echo "== HTTP $code, $(wc -c < /tmp/out.bin 2>/dev/null) bytes"
-            grep -i -E 'content-type|content-length|content-disposition|x-sck|http/' /tmp/hdr.txt | head -8
-            head -c 900 /tmp/out.bin 2>/dev/null | tr -c '[:print:]\n' '.'
-            echo
+              "${BASE}$1" 2>/tmp/curlerr.txt) || code="CURL_EXIT_$?_$(head -c 120 /tmp/curlerr.txt)"
+            line="== HTTP $code, $(wc -c < /tmp/out.bin 2>/dev/null || echo 0) bytes"
+            echo "$line" | tee -a results.txt
+            grep -i -E 'content-type|content-length|content-disposition|x-sck|http/' /tmp/hdr.txt 2>/dev/null | head -8 | tee -a results.txt
+            head -c 900 /tmp/out.bin 2>/dev/null | tr -c '[:print:]\n' '.' | tee -a results.txt
+            echo | tee -a results.txt
           }
-          probe "/api/health" 60
-          probe "/api/info?url=https%3A%2F%2Fsoundcloud.com%2Falexg232%2Fharvey" 180
-          probe "/api/audio?url=https%3A%2F%2Fsoundcloud.com%2Falexg232%2Fharvey" 220
-          probe "/api/info?url=https%3A%2F%2Fsoundcloud.com%2Fsayiko-700593227%2Fharvey" 180
+          probe "/sca/api/health" 45
+          probe "/yta/api/health" 45
+          probe "/sck/api/health" 45
+          probe "/sck/api/info?url=https%3A%2F%2Fsoundcloud.com%2Falexg232%2Fharvey" 170
+          probe "/sck/api/audio?url=https%3A%2F%2Fsoundcloud.com%2Falexg232%2Fharvey" 220
+          cat results.txt >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: probe-results
+          path: results.txt
